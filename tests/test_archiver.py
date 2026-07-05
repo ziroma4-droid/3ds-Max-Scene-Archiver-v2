@@ -1,5 +1,7 @@
+import io
 import runpy
 import tempfile
+import types
 import unittest
 import zipfile
 from pathlib import Path
@@ -11,6 +13,7 @@ MODULE = runpy.run_path(str(ROOT / "3dsMax Archive.py"), run_name="archiver_unde
 PathExtractor = MODULE["PathExtractor"]
 MaxParser = MODULE["MaxParser"]
 Archiver = MODULE["Archiver"]
+App = MODULE["App"]
 
 
 class PathExtractorTests(unittest.TestCase):
@@ -52,6 +55,19 @@ class PathExtractorTests(unittest.TestCase):
         )
 
 
+class AppPathTests(unittest.TestCase):
+    def test_default_archive_path_follows_selected_scene(self):
+        self.assertEqual(
+            App.default_archive_path(r"D:\project\Scene_01.max"),
+            r"D:\project\Scene_01_archive.zip",
+        )
+        self.assertEqual(
+            App.default_archive_path("D:/project/Scene_02.MAX"),
+            "D:/project/Scene_02_archive.zip",
+        )
+        self.assertEqual(App.default_archive_path(""), "")
+
+
 class RelativeArchiveTests(unittest.TestCase):
     def setUp(self):
         self.parser_globals = MaxParser.parse.__globals__
@@ -82,6 +98,7 @@ class RelativeArchiveTests(unittest.TestCase):
             )
 
             self.assertTrue(ok)
+            self.assertEqual(stats["resources"], 1)
             self.assertEqual(stats["missing"], 0)
             self.assertEqual(stats["errors"], [])
             with zipfile.ZipFile(archive) as zip_file:
@@ -117,6 +134,7 @@ class RelativeArchiveTests(unittest.TestCase):
             )
 
             self.assertTrue(ok)
+            self.assertEqual(stats["resources"], 3)
             self.assertEqual(stats["missing"], 0)
             self.assertEqual(stats["errors"], [])
             with zipfile.ZipFile(archive) as zip_file:
@@ -149,6 +167,7 @@ class RelativeArchiveTests(unittest.TestCase):
                 report = zip_file.read("_report.txt").decode("utf-8")
             self.assertIn("ОТСУТСТВУЕТ (1)", report)
             self.assertIn(str(root / "maps" / "missing.jpg"), report)
+            self.assertIn("Ресурсов добавлено: 0", report)
 
     def test_missing_resource_in_unselected_category_is_not_a_warning(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -204,6 +223,46 @@ class RelativeArchiveTests(unittest.TestCase):
             self.assertIn("ОШИБКИ ДОБАВЛЕНИЯ (1)", report)
             self.assertIn("test write error", report)
 
+    def test_ole_parser_uses_only_asset_metadata_stream(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            maps = root / "maps"
+            maps.mkdir()
+            texture = maps / "wall.jpg"
+            texture.write_bytes(b"texture")
+            scene = root / "scene.max"
+            scene.write_bytes(b"fake OLE scene")
+
+            summary_stream = ["\x05DocumentSummaryInformation"]
+            metadata_stream = ["FileAssetMetaData3"]
+            scene_stream = ["Scene_Compressed"]
+            stream_data = {
+                tuple(summary_stream): b"\0ghost.jpg\0",
+                tuple(metadata_stream): b"\0maps\\wall.jpg\0",
+                tuple(scene_stream): b"\0.40.rs\0",
+            }
+
+            fake_ole = mock.Mock()
+            fake_ole.listdir.return_value = [
+                summary_stream, metadata_stream, scene_stream
+            ]
+            fake_ole.openstream.side_effect = (
+                lambda stream: io.BytesIO(stream_data[tuple(stream)])
+            )
+            fake_ole_module = types.SimpleNamespace(
+                OleFileIO=lambda _filepath: fake_ole
+            )
+
+            with mock.patch.dict(
+                self.parser_globals,
+                {"HAS_OLEFILE": True, "olefile": fake_ole_module},
+            ):
+                result = MaxParser().parse(str(scene))
+
+            self.assertEqual(result, {"texture": {str(texture)}})
+            fake_ole.openstream.assert_called_once_with(metadata_stream)
+            fake_ole.close.assert_called_once()
+
     def test_xref_scene_and_its_resources_are_archived_recursively(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -235,6 +294,7 @@ class RelativeArchiveTests(unittest.TestCase):
             )
 
             self.assertTrue(ok)
+            self.assertEqual(stats["resources"], 2)
             self.assertEqual(stats["missing"], 0)
             self.assertEqual(stats["errors"], [])
             with zipfile.ZipFile(archive) as zip_file:
