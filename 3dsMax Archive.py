@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-3Ds Max Scene Archiver in ZIP v2.1
+Max Scene Packager v2.5
 Автор: @RomanCG
 GitHub: https://github.com/ziroma4-droid/3ds-Max-Scene-Archiver-v2
-Behance: https://www.behance.net/Romancg62fe
+Telegram: https://t.me/Romak04
+Email: romancg@yandex.ru
 """
 
 import os
@@ -44,6 +45,20 @@ class PathExtractor:
 
     ALL_EXT = TEXTURE_EXT | IES_EXT | PROXY_EXT | SCENE_EXT | CACHE_EXT | AUDIO_EXT | LUT_EXT
 
+    ASCII_ABSOLUTE_PATTERN = rb'[A-Za-z]:[\\\/][^\x00-\x1f"*<>|]{5,260}\.[A-Za-z0-9]{1,10}'
+    ASCII_UNC_PATTERN = (
+        rb'[\\\/]{2}[^\\\/\x00-\x1f"*<>|:]+[\\\/]'
+        rb'[^\\\/\x00-\x1f"*<>|:]+[\\\/]'
+        rb'[^\x00-\x1f"*<>|:]{1,260}\.[A-Za-z0-9]{1,10}'
+    )
+    ASCII_RELATIVE_PATTERN = (
+        rb'(?:^|[\x00-\x1f])'
+        rb'((?:\.{1,2}[\\\/])?'
+        rb'(?:[^\\\/\x00-\x1f"*<>|:]+[\\\/])*'
+        rb'[^\\\/\x00-\x1f"*<>|:]+\.[A-Za-z0-9]{1,10})'
+        rb'(?=$|[\x00-\x1f])'
+    )
+
     
     def extract_paths(self, data, exclude_ext=None):
         if exclude_ext is None:
@@ -53,16 +68,25 @@ class PathExtractor:
         
         # ASCII
         try:
-            pattern = rb'[A-Za-z]:[\\\/][^\x00-\x1f"*<>|]{5,260}\.[A-Za-z0-9]{1,10}'
-            for match in re.finditer(pattern, data):
+            for pattern in (self.ASCII_ABSOLUTE_PATTERN, self.ASCII_UNC_PATTERN):
+                for match in re.finditer(pattern, data):
+                    try:
+                        path = match.group(0).decode('ascii', errors='ignore')
+                        path = self.normalize(path)
+                        if self.is_valid(path, exclude_ext):
+                            paths.add(path)
+                    except Exception:
+                        pass
+
+            for match in re.finditer(self.ASCII_RELATIVE_PATTERN, data):
                 try:
-                    path = match.group(0).decode('ascii', errors='ignore')
+                    path = match.group(1).decode('ascii', errors='ignore')
                     path = self.normalize(path)
                     if self.is_valid(path, exclude_ext):
                         paths.add(path)
-                except:
+                except Exception:
                     pass
-        except:
+        except Exception:
             pass
         
         # UTF-16
@@ -90,15 +114,55 @@ class PathExtractor:
                         path = self.normalize(path)
                         if self.is_valid(path, exclude_ext):
                             paths.add(path)
-                    except:
+                    except Exception:
                         pass
                     i = j
                 else:
                     i += 1
-        except:
+        except Exception:
+            pass
+
+        # Null-terminated UTF-16 strings, including relative and UNC paths.
+        try:
+            for path in self.extract_utf16_strings(data):
+                path = self.normalize(path)
+                if self.is_valid(path, exclude_ext):
+                    paths.add(path)
+        except Exception:
             pass
         
         return paths
+
+    def extract_utf16_strings(self, data):
+        strings = set()
+
+        # Try both byte alignments because OLE stream data does not guarantee
+        # that a UTF-16 string starts at an even stream offset.
+        for offset in (0, 1):
+            chars = []
+
+            def flush():
+                if 5 <= len(chars) <= 520:
+                    strings.add(''.join(chars))
+                chars.clear()
+
+            for i in range(offset, len(data) - 1, 2):
+                codepoint = data[i] | (data[i + 1] << 8)
+                if codepoint == 0:
+                    flush()
+                    continue
+
+                char = chr(codepoint)
+                if codepoint >= 32 and char.isprintable():
+                    chars.append(char)
+                    if len(chars) > 520:
+                        flush()
+                else:
+                    flush()
+
+            flush()
+
+        return strings
     
     def normalize(self, path):
         if not path:
@@ -110,14 +174,34 @@ class PathExtractor:
     def is_valid(self, path, exclude_ext):
         if not path or len(path) < 5:
             return False
-        if not re.match(r'^[A-Za-z]:\\', path):
+
+        is_drive_absolute = bool(re.match(r'^[A-Za-z]:\\', path))
+        is_unc = path.startswith('\\\\')
+        is_relative = not is_drive_absolute and not is_unc
+
+        if is_unc:
+            # A usable UNC asset path needs server, share and file components.
+            if len([part for part in path[2:].split('\\') if part]) < 3:
+                return False
+        elif is_relative:
+            if path.startswith('\\') or ':' in path:
+                return False
+
+        if any(char in path for char in '"*<>|'):
             return False
+
         ext = os.path.splitext(path)[1].lower()
         if ext in exclude_ext:
             return False
         if ext not in self.ALL_EXT:
             return False
         return True
+
+    def resolve(self, path, base_dir):
+        path = self.normalize(path)
+        if re.match(r'^[A-Za-z]:\\', path) or path.startswith('\\\\'):
+            return os.path.normpath(path)
+        return os.path.normpath(os.path.join(base_dir, path))
     
     def categorize(self, path):
         ext = os.path.splitext(path)[1].lower()
@@ -128,7 +212,7 @@ class PathExtractor:
         elif ext in self.PROXY_EXT:
             return 'proxy'
         elif ext in self.SCENE_EXT:
-            return 'scene'
+            return 'xref'
         elif ext in self.CACHE_EXT:
             return 'cache'
         elif ext in self.AUDIO_EXT:
@@ -150,15 +234,51 @@ class MaxParser:
     
     def parse(self, filepath):
         result = defaultdict(set)
+        visited = set()
+        root_scene = os.path.normcase(os.path.abspath(filepath))
+
+        self.parse_scene_recursive(filepath, result, visited, root_scene)
+
+        total = sum(len(v) for v in result.values())
+        self.log(f"Найдено: {total}")
+
+        return dict(result)
+
+    def parse_scene_recursive(self, filepath, result, visited, root_scene):
+        filepath = os.path.abspath(filepath)
+        scene_key = os.path.normcase(filepath)
+
+        if scene_key in visited:
+            return
+        visited.add(scene_key)
         
         if not os.path.exists(filepath):
             self.log(f"Файл не найден: {filepath}")
-            return dict(result)
+            return
         
         size_mb = os.path.getsize(filepath) / 1024 / 1024
         self.log(f"Анализ: {os.path.basename(filepath)} ({size_mb:.1f} MB)")
         
-        exclude = PathExtractor.SCENE_EXT
+        # XRef scene extensions are deliberately included and processed below.
+        exclude = set()
+        scene_dir = os.path.dirname(os.path.abspath(filepath))
+        xrefs = set()
+
+        def add_paths(data):
+            paths = self.extractor.extract_paths(data, exclude)
+            for path in paths:
+                resolved_path = self.extractor.resolve(path, scene_dir)
+                resolved_key = os.path.normcase(os.path.abspath(resolved_path))
+                category = self.extractor.categorize(resolved_path)
+
+                # Do not add the main scene if a circular XRef points back to it.
+                if category == 'xref' and resolved_key == root_scene:
+                    continue
+
+                if category:
+                    result[category].add(resolved_path)
+                    if category == 'xref':
+                        xrefs.add(resolved_path)
         
         try:
             if HAS_OLEFILE:
@@ -167,30 +287,22 @@ class MaxParser:
                 for stream in ole.listdir():
                     try:
                         data = ole.openstream(stream).read()
-                        paths = self.extractor.extract_paths(data, exclude)
-                        for p in paths:
-                            cat = self.extractor.categorize(p)
-                            if cat:
-                                result[cat].add(p)
-                    except:
+                        add_paths(data)
+                    except Exception:
                         pass
                 ole.close()
             else:
                 self.log("Прямой парсер...")
                 with open(filepath, 'rb') as f:
                     data = f.read()
-                paths = self.extractor.extract_paths(data, exclude)
-                for p in paths:
-                    cat = self.extractor.categorize(p)
-                    if cat:
-                        result[cat].add(p)
+                add_paths(data)
         except Exception as e:
             self.log(f"Ошибка: {e}")
-        
-        total = sum(len(v) for v in result.values())
-        self.log(f"Найдено: {total}")
-        
-        return dict(result)
+
+        # Parse nested .max XRefs to collect their resources and further XRefs.
+        for xref_path in sorted(xrefs, key=str.casefold):
+            if os.path.splitext(xref_path)[1].lower() == '.max' and os.path.exists(xref_path):
+                self.parse_scene_recursive(xref_path, result, visited, root_scene)
 
 
 class Archiver:
@@ -209,6 +321,26 @@ class Archiver:
         logging.info(msg)
         if self.log_func:
             self.log_func(msg)
+
+    @staticmethod
+    def make_archive_name(filename, organize, used_names, category=None):
+        if organize:
+            root = "xrefs/" if category == 'xref' else "maps/"
+        else:
+            root = ""
+        arcname = f"{root}{filename}"
+
+        if arcname.lower() not in used_names:
+            return arcname
+
+        # Preserve the original filename. Each repeated collision is placed at
+        # the next folder level inside the resources root.
+        counter = 1
+        while True:
+            arcname = f"{root}duplicates_{counter}/{filename}"
+            if arcname.lower() not in used_names:
+                return arcname
+            counter += 1
     
     def create(self, scene_path, archive_path, categories, organize=True, progress_func=None):
         
@@ -230,12 +362,13 @@ class Archiver:
             # Проверка файлов
             found = defaultdict(set)
             missing = defaultdict(set)
+            archived = defaultdict(set)
             
             for cat, paths in paths_dict.items():
                 for p in paths:
                     if os.path.exists(p):
                         found[cat].add(p)
-                    else:
+                    elif categories.get(cat, False):
                         missing[cat].add(p)
                         stats['missing'] += 1
             
@@ -255,9 +388,9 @@ class Archiver:
                 
                 # Ресурсы
                 files_list = []
-                for cat, paths in found.items():
+                for cat, paths in sorted(found.items()):
                     if categories.get(cat, False):
-                        for p in paths:
+                        for p in sorted(paths, key=str.casefold):
                             files_list.append((p, cat))
                 
                 total = len(files_list)
@@ -265,35 +398,26 @@ class Archiver:
                 for idx, (fpath, cat) in enumerate(files_list):
                     try:
                         fname = os.path.basename(fpath)
+                        arcname = self.make_archive_name(fname, organize, used_names, cat)
                         
-                        if organize:
-                            arcname = f"maps/{fname}"
-                        else:
-                            arcname = fname
-                        
-                        # Конфликт имён
-                        if arcname.lower() in used_names:
-                            base, ext = os.path.splitext(arcname)
-                            counter = 1
-                            while f"{base}_{counter}{ext}".lower() in used_names:
-                                counter += 1
-                            arcname = f"{base}_{counter}{ext}"
-                        
-                        used_names.add(arcname.lower())
                         zf.write(fpath, arcname)
+                        used_names.add(arcname.lower())
+                        archived[cat].add(fpath)
                         stats['added'] += 1
                         
                         self.log(f"+ {arcname}")
                         
                     except Exception as e:
-                        stats['errors'].append(str(e))
-                        self.log(f"! Ошибка: {e}")
+                        stats['errors'].append({'path': fpath, 'message': str(e)})
+                        self.log(f"! Ошибка: {fpath}: {e}")
                     
                     if progress_func and total > 0:
                         progress_func(40 + int(idx / total * 55))
                 
                 # Отчёт
-                report = self.make_report(scene_path, archive_path, found, missing, categories)
+                report = self.make_report(
+                    scene_path, archive_path, archived, missing, categories, stats['errors']
+                )
                 zf.writestr("_report.txt", report.encode('utf-8'))
                 stats['added'] += 1
             
@@ -302,14 +426,21 @@ class Archiver:
             
             size_mb = os.path.getsize(archive_path) / 1024 / 1024
             self.log(f"Готово! Файлов: {stats['added']}, Размер: {size_mb:.1f} MB")
+
+            if stats['missing'] or stats['errors']:
+                self.log(
+                    f"ВНИМАНИЕ! Отсутствует: {stats['missing']}, "
+                    f"ошибок добавления: {len(stats['errors'])}"
+                )
             
-            return True, stats['added'], size_mb
+            return True, stats['added'], size_mb, stats
             
         except Exception as e:
             self.log(f"ОШИБКА: {e}")
-            return False, 0, 0
+            stats['errors'].append({'path': archive_path, 'message': str(e)})
+            return False, 0, 0, stats
     
-    def make_report(self, scene, archive, found, missing, categories):
+    def make_report(self, scene, archive, archived, missing, categories, errors):
         lines = [
             "=" * 50,
             "ОТЧЁТ АРХИВАЦИИ",
@@ -321,39 +452,50 @@ class Archiver:
             "",
             "Автор: @RomanCG",
             "GitHub: https://github.com/ziroma4-droid/3ds-Max-Scene-Archiver-v2",
-            "Behance: https://www.behance.net/Romancg62fe",
+            "Telegram: https://t.me/Romak04",
+            "Email: romancg@yandex.ru",
             "",
             "-" * 50,
             "ДОБАВЛЕНО:",
         ]
         
-        for cat, paths in found.items():
+        for cat, paths in archived.items():
             if categories.get(cat, False) and paths:
                 lines.append(f"\n[{cat.upper()}]")
                 for p in sorted(paths):
                     lines.append(f"  {os.path.basename(p)}")
         
-        if any(missing.values()):
+        stats_missing = sum(len(paths) for paths in missing.values())
+        if stats_missing:
             lines.append("\n" + "-" * 50)
-            lines.append("ОТСУТСТВУЕТ:")
+            lines.append(f"ОТСУТСТВУЕТ ({stats_missing}):")
             for cat, paths in missing.items():
-                if paths:
+                if categories.get(cat, False) and paths:
                     lines.append(f"\n[{cat.upper()}]")
                     for p in sorted(paths):
                         lines.append(f"  {p}")
+
+        if errors:
+            lines.append("\n" + "-" * 50)
+            lines.append(f"ОШИБКИ ДОБАВЛЕНИЯ ({len(errors)}):")
+            for error in errors:
+                lines.append(f"  {error['path']}")
+                lines.append(f"    {error['message']}")
         
         return '\n'.join(lines)
 
 
 class App:
-    
-    VERSION = "2.1"
+
+    APP_NAME = "Max Scene Packager"
+    VERSION = "2.5"
     GITHUB = "https://github.com/ziroma4-droid/3ds-Max-Scene-Archiver-v2"
-    BEHANCE = "https://www.behance.net/Romancg62fe"
+    TELEGRAM = "https://t.me/Romak04"
+    EMAIL = "romancg@yandex.ru"
     
     def __init__(self, root):
         self.root = root
-        self.root.title(f"3Ds Max Scene Archiver in ZIP v{self.VERSION}")
+        self.root.title(f"{self.APP_NAME} v{self.VERSION}")
         self.root.geometry("850x700")
         
         self.scene_var = tk.StringVar()
@@ -367,6 +509,7 @@ class App:
             'cache': tk.BooleanVar(value=True),
             'audio': tk.BooleanVar(value=True),
             'lut': tk.BooleanVar(value=True),
+            'xref': tk.BooleanVar(value=True),
         }
         
         self.archiver = Archiver(self.log)
@@ -377,7 +520,7 @@ class App:
         main.pack(fill='both', expand=True)
         
         # Заголовок
-        ttk.Label(main, text=f"3Ds Max Scene Archiver in ZIP v{self.VERSION}",
+        ttk.Label(main, text=f"{self.APP_NAME} v{self.VERSION}",
                  font=('Segoe UI', 14, 'bold')).pack(pady=(0, 10))
         
         # Файлы
@@ -396,8 +539,8 @@ class App:
         cat_frame = ttk.LabelFrame(main, text="Типы файлов", padding=5)
         cat_frame.pack(fill='x', pady=10)
         
-        labels = {'texture': 'Текстуры', 'ies': 'IES', 'proxy': 'Прокси', 
-                 'cache': 'Кэш', 'audio': 'Аудио', 'lut': 'LUT'}
+        labels = {'texture': 'Текстуры', 'ies': 'IES', 'proxy': 'Прокси',
+                 'cache': 'Кэш', 'audio': 'Аудио', 'lut': 'LUT', 'xref': 'XRef'}
         
         for i, (key, label) in enumerate(labels.items()):
             ttk.Checkbutton(cat_frame, text=label, variable=self.cat_vars[key]).grid(
@@ -448,10 +591,17 @@ class App:
         
         ttk.Label(links, text="•").pack(side='left')
         
-        be = tk.Label(links, text="Behance", fg='#0066cc', cursor='hand2',
-                     font=('Segoe UI', 9, 'underline'))
-        be.pack(side='left', padx=5)
-        be.bind('<Button-1>', lambda e: webbrowser.open(self.BEHANCE))
+        telegram = tk.Label(links, text="Telegram", fg='#0066cc', cursor='hand2',
+                           font=('Segoe UI', 9, 'underline'))
+        telegram.pack(side='left', padx=5)
+        telegram.bind('<Button-1>', lambda e: webbrowser.open(self.TELEGRAM))
+
+        ttk.Label(links, text="•").pack(side='left')
+
+        email = tk.Label(links, text=self.EMAIL, fg='#0066cc', cursor='hand2',
+                        font=('Segoe UI', 9, 'underline'))
+        email.pack(side='left', padx=5)
+        email.bind('<Button-1>', lambda e: webbrowser.open(f"mailto:{self.EMAIL}"))
     
     def browse_scene(self):
         f = filedialog.askopenfilename(filetypes=[("3ds Max", "*.max")])
@@ -546,7 +696,7 @@ class App:
         try:
             cats = {k: v.get() for k, v in self.cat_vars.items()}
             
-            ok, count, size = self.archiver.create(
+            ok, count, size, stats = self.archiver.create(
                 self.scene_var.get(),
                 self.archive_var.get(),
                 cats,
@@ -555,8 +705,28 @@ class App:
             )
             
             if ok:
-                self.set_status(f"Готово: {count} файлов, {size:.1f} MB")
-                messagebox.showinfo("Успех", f"Архив создан!\n\nФайлов: {count}\nРазмер: {size:.1f} MB")
+                if stats['missing'] or stats['errors']:
+                    warning_lines = [
+                        "Архив создан, но не все ресурсы удалось добавить.",
+                        "",
+                        f"Отсутствует файлов: {stats['missing']}",
+                        f"Ошибок добавления: {len(stats['errors'])}",
+                        "",
+                        "Подробности находятся в _report.txt внутри архива.",
+                    ]
+                    self.set_status(
+                        f"Готово с предупреждениями: отсутствует {stats['missing']}, "
+                        f"ошибок {len(stats['errors'])}"
+                    )
+                    messagebox.showwarning(
+                        "Архив создан с предупреждениями", "\n".join(warning_lines)
+                    )
+                else:
+                    self.set_status(f"Готово: {count} файлов, {size:.1f} MB")
+                    messagebox.showinfo(
+                        "Успех",
+                        f"Архив создан!\n\nФайлов: {count}\nРазмер: {size:.1f} MB"
+                    )
             else:
                 self.set_status("Ошибка")
                 messagebox.showerror("Ошибка", "Не удалось создать архив")
