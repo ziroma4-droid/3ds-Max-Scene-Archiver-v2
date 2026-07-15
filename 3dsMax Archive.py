@@ -264,6 +264,7 @@ class MaxParser:
     def __init__(self, log_func=None):
         self.log_func = log_func
         self.extractor = PathExtractor()
+        self.local_asset_indexes = {}
     
     def log(self, msg):
         if self.log_func:
@@ -272,6 +273,7 @@ class MaxParser:
     def parse(self, filepath):
         result = defaultdict(set)
         visited = set()
+        self.local_asset_indexes = {}
         root_scene = os.path.normcase(os.path.abspath(filepath))
 
         self.parse_scene_recursive(filepath, result, visited, root_scene)
@@ -280,6 +282,91 @@ class MaxParser:
         self.log(f"Найдено: {total}")
 
         return dict(result)
+
+    def build_local_asset_index(self, scene_dir):
+        scene_dir = os.path.abspath(scene_dir)
+        index_key = os.path.normcase(scene_dir)
+        if index_key in self.local_asset_indexes:
+            return self.local_asset_indexes[index_key]
+
+        index = defaultdict(list)
+        try:
+            for root, dirs, filenames in os.walk(scene_dir):
+                dirs.sort(key=str.casefold)
+                for filename in sorted(filenames, key=str.casefold):
+                    ext = os.path.splitext(filename)[1].lower()
+                    if ext in self.extractor.ALL_EXT:
+                        index[filename.lower()].append(os.path.join(root, filename))
+        except OSError as e:
+            self.log(f"Не удалось просканировать папку сцены: {scene_dir}: {e}")
+
+        self.local_asset_indexes[index_key] = index
+        return index
+
+    @staticmethod
+    def path_parts(path):
+        path = path.replace('/', '\\')
+        drive, tail = os.path.splitdrive(path)
+        parts = [part.lower() for part in tail.split('\\') if part]
+
+        # For UNC paths, ignore server/share when comparing with local files.
+        if not drive and path.startswith('\\\\') and len(parts) > 2:
+            parts = parts[2:]
+
+        return parts
+
+    @staticmethod
+    def common_suffix_length(left, right):
+        count = 0
+        for left_part, right_part in zip(reversed(left), reversed(right)):
+            if left_part != right_part:
+                break
+            count += 1
+        return count
+
+    def find_near_scene(self, path, scene_dir):
+        filename = path.replace('/', '\\').rsplit('\\', 1)[-1]
+        if not filename:
+            return None
+
+        candidates = self.build_local_asset_index(scene_dir).get(filename.lower(), [])
+        if not candidates:
+            return None
+
+        requested_parts = self.path_parts(path)
+
+        def score(candidate):
+            try:
+                relative = os.path.relpath(candidate, scene_dir)
+            except ValueError:
+                relative = candidate
+
+            candidate_parts = self.path_parts(relative)
+            return (
+                -self.common_suffix_length(requested_parts, candidate_parts),
+                len(candidate_parts),
+                candidate.lower(),
+            )
+
+        return sorted(candidates, key=score)[0]
+
+    def resolve_scene_asset(self, path, scene_dir):
+        resolved_path = self.extractor.resolve(path, scene_dir)
+        if os.path.exists(resolved_path):
+            return resolved_path
+
+        nearby_path = self.find_near_scene(path, scene_dir)
+        if nearby_path:
+            if os.path.normcase(os.path.abspath(nearby_path)) != os.path.normcase(
+                os.path.abspath(resolved_path)
+            ):
+                self.log(
+                    "Найдено рядом со сценой: "
+                    f"{os.path.basename(path)} -> {nearby_path}"
+                )
+            return nearby_path
+
+        return resolved_path
 
     def parse_scene_recursive(self, filepath, result, visited, root_scene):
         filepath = os.path.abspath(filepath)
@@ -306,7 +393,7 @@ class MaxParser:
                 data, exclude, include_relative=include_relative
             )
             for path in paths:
-                resolved_path = self.extractor.resolve(path, scene_dir)
+                resolved_path = self.resolve_scene_asset(path, scene_dir)
                 resolved_key = os.path.normcase(os.path.abspath(resolved_path))
                 category = self.extractor.categorize(resolved_path)
 

@@ -104,6 +104,62 @@ class RelativeArchiveTests(unittest.TestCase):
             with zipfile.ZipFile(archive) as zip_file:
                 self.assertIn("maps/wall.jpg", zip_file.namelist())
 
+    def test_missing_asset_is_found_near_scene_by_filename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            textures = root / "textures"
+            textures.mkdir()
+            texture = textures / "wall.jpg"
+            texture.write_bytes(b"texture")
+
+            scene = root / "scene.max"
+            scene.write_bytes(b"\0missing\\wall.jpg\0")
+            archive = root / "scene.zip"
+
+            archiver = Archiver.__new__(Archiver)
+            archiver.log_func = None
+            archiver.parser = MaxParser()
+
+            ok, _, _, stats = archiver.create(
+                str(scene), str(archive), {"texture": True}, organize=True
+            )
+
+            self.assertTrue(ok)
+            self.assertEqual(stats["resources"], 1)
+            self.assertEqual(stats["missing"], 0)
+            self.assertEqual(stats["errors"], [])
+            with zipfile.ZipFile(archive) as zip_file:
+                self.assertIn("maps/wall.jpg", zip_file.namelist())
+
+    def test_near_scene_search_prefers_matching_path_suffix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            assets = root / "assets"
+            other = root / "other"
+            assets.mkdir()
+            other.mkdir()
+            preferred = assets / "same.jpg"
+            preferred.write_bytes(b"preferred")
+            (other / "same.jpg").write_bytes(b"other")
+
+            scene = root / "scene.max"
+            scene.write_bytes(b"\0offline\\assets\\same.jpg\0")
+            archive = root / "scene.zip"
+
+            archiver = Archiver.__new__(Archiver)
+            archiver.log_func = None
+            archiver.parser = MaxParser()
+
+            ok, _, _, stats = archiver.create(
+                str(scene), str(archive), {"texture": True}, organize=True
+            )
+
+            self.assertTrue(ok)
+            self.assertEqual(stats["resources"], 1)
+            self.assertEqual(stats["missing"], 0)
+            with zipfile.ZipFile(archive) as zip_file:
+                self.assertEqual(zip_file.read("maps/same.jpg"), b"preferred")
+
     def test_duplicate_filenames_are_placed_in_separate_folders(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -304,6 +360,44 @@ class RelativeArchiveTests(unittest.TestCase):
             self.assertIn("xrefs/nested.max", names)
             self.assertIn("maps/xref_texture.jpg", names)
             self.assertNotIn("xrefs/scene.max", names)
+
+    def test_missing_xref_is_found_near_scene_and_parsed_recursively(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            xref_dir = root / "xrefs"
+            maps_dir = xref_dir / "maps"
+            maps_dir.mkdir(parents=True)
+
+            texture = maps_dir / "xref_texture.jpg"
+            texture.write_bytes(b"xref texture")
+
+            nested_scene = xref_dir / "nested.max"
+            nested_scene.write_bytes(b"\0maps\\xref_texture.jpg\0")
+
+            scene = root / "scene.max"
+            scene.write_bytes(b"\0missing\\nested.max\0")
+            archive = root / "scene.zip"
+
+            archiver = Archiver.__new__(Archiver)
+            archiver.log_func = None
+            archiver.parser = MaxParser()
+
+            ok, _, _, stats = archiver.create(
+                str(scene),
+                str(archive),
+                {"texture": True, "xref": True},
+                organize=True,
+            )
+
+            self.assertTrue(ok)
+            self.assertEqual(stats["resources"], 2)
+            self.assertEqual(stats["missing"], 0)
+            self.assertEqual(stats["errors"], [])
+            with zipfile.ZipFile(archive) as zip_file:
+                names = set(zip_file.namelist())
+
+            self.assertIn("xrefs/nested.max", names)
+            self.assertIn("maps/xref_texture.jpg", names)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.7+-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
+![License](https://img.shields.io/badge/License-Attribution%20Required-green.svg)
 
 ## 🎯 Возможности
 
@@ -138,7 +138,7 @@ pip install olefile
 
 ## 📝 Лицензия
 
-MIT License
+Использование, модификация и распространение разрешены только с указанием авторства. Подробности см. в `LICENSE.md`.
 
 ## 👤 Автор
 
