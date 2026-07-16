@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Max Scene Packager v2.7
+Max Scene Packager v2.8
 Автор: @RomanCG
 GitHub: https://github.com/ziroma4-droid/3ds-Max-Scene-Archiver-v2
 Telegram: https://t.me/Romak04
@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import ctypes
+import glob
 import zipfile
 import logging
 import webbrowser
@@ -260,11 +261,21 @@ class PathExtractor:
 
 
 class MaxParser:
+
+    AUTODESK_MAX_ASSET_DIRS = ('maps', 'sceneassets', 'materiallibraries')
+    AUTODESK_PROGRAMDATA_PLUGIN_PATTERNS = (
+        '3dsmax-civilview-*',
+        'AdvancedModeling3dsMax*',
+        'Retopology3dsMax*',
+        'SubstanceIn3dsMax*',
+    )
     
     def __init__(self, log_func=None):
         self.log_func = log_func
         self.extractor = PathExtractor()
         self.local_asset_indexes = {}
+        self.system_asset_index = None
+        self.system_asset_roots = None
     
     def log(self, msg):
         if self.log_func:
@@ -301,6 +312,87 @@ class MaxParser:
             self.log(f"Не удалось просканировать папку сцены: {scene_dir}: {e}")
 
         self.local_asset_indexes[index_key] = index
+        return index
+
+    @staticmethod
+    def add_unique_path(paths, path):
+        if not path:
+            return
+
+        normalized = os.path.normpath(path)
+        key = os.path.normcase(os.path.abspath(normalized))
+        if key not in paths:
+            paths[key] = normalized
+
+    def default_system_asset_roots(self):
+        roots = {}
+
+        for env_name in ('ProgramFiles', 'ProgramFiles(x86)'):
+            program_files = os.environ.get(env_name)
+            if not program_files:
+                continue
+
+            self.add_unique_path(
+                roots,
+                os.path.join(
+                    program_files,
+                    'Common Files',
+                    'Autodesk Shared',
+                    'Materials',
+                )
+            )
+
+            autodesk_dir = os.path.join(program_files, 'Autodesk')
+            for max_dir in glob.glob(os.path.join(autodesk_dir, '3ds Max*')):
+                if not os.path.isdir(max_dir):
+                    continue
+
+                dirname = os.path.basename(max_dir).lower()
+                if 'sdk' in dirname:
+                    continue
+
+                for asset_dir in self.AUTODESK_MAX_ASSET_DIRS:
+                    self.add_unique_path(roots, os.path.join(max_dir, asset_dir))
+
+        program_data = os.environ.get('ProgramData')
+        if program_data:
+            plugins_dir = os.path.join(
+                program_data, 'Autodesk', 'ApplicationPlugins'
+            )
+            for pattern in self.AUTODESK_PROGRAMDATA_PLUGIN_PATTERNS:
+                for plugin_dir in glob.glob(os.path.join(plugins_dir, pattern)):
+                    self.add_unique_path(roots, os.path.join(plugin_dir, 'Contents'))
+
+        return sorted(
+            (path for path in roots.values() if os.path.isdir(path)),
+            key=str.casefold,
+        )
+
+    def build_system_asset_index(self):
+        if self.system_asset_index is not None:
+            return self.system_asset_index
+
+        roots = self.default_system_asset_roots()
+        self.system_asset_roots = roots
+        index = defaultdict(list)
+
+        for root_dir in roots:
+            try:
+                for root, dirs, filenames in os.walk(root_dir):
+                    dirs.sort(key=str.casefold)
+                    for filename in sorted(filenames, key=str.casefold):
+                        ext = os.path.splitext(filename)[1].lower()
+                        if ext in self.extractor.ALL_EXT:
+                            index[filename.lower()].append(os.path.join(root, filename))
+            except OSError as e:
+                self.log(
+                    f"Не удалось просканировать библиотеку Autodesk: {root_dir}: {e}"
+                )
+
+        if roots:
+            self.log(f"Библиотеки Autodesk для поиска: {len(roots)}")
+
+        self.system_asset_index = index
         return index
 
     @staticmethod
@@ -350,6 +442,27 @@ class MaxParser:
 
         return sorted(candidates, key=score)[0]
 
+    def find_in_system_libraries(self, path):
+        filename = path.replace('/', '\\').rsplit('\\', 1)[-1]
+        if not filename:
+            return None
+
+        candidates = self.build_system_asset_index().get(filename.lower(), [])
+        if not candidates:
+            return None
+
+        requested_parts = self.path_parts(path)
+
+        def score(candidate):
+            candidate_parts = self.path_parts(candidate)
+            return (
+                -self.common_suffix_length(requested_parts, candidate_parts),
+                len(candidate_parts),
+                candidate.lower(),
+            )
+
+        return sorted(candidates, key=score)[0]
+
     def resolve_scene_asset(self, path, scene_dir):
         resolved_path = self.extractor.resolve(path, scene_dir)
         if os.path.exists(resolved_path):
@@ -365,6 +478,14 @@ class MaxParser:
                     f"{os.path.basename(path)} -> {nearby_path}"
                 )
             return nearby_path
+
+        system_path = self.find_in_system_libraries(path)
+        if system_path:
+            self.log(
+                "Найдено в библиотеке Autodesk: "
+                f"{os.path.basename(path)} -> {system_path}"
+            )
+            return system_path
 
         return resolved_path
 
@@ -640,7 +761,7 @@ class Archiver:
 class App:
 
     APP_NAME = "Max Scene Packager"
-    VERSION = "2.7"
+    VERSION = "2.8"
     GITHUB = "https://github.com/ziroma4-droid/3ds-Max-Scene-Archiver-v2"
     TELEGRAM = "https://t.me/Romak04"
     EMAIL = "romancg@yandex.ru"
