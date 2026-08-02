@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Max Scene Packager v2.8
+Max Scene Packager v2.9
 Автор: @RomanCG
 GitHub: https://github.com/ziroma4-droid/3ds-Max-Scene-Archiver-v2
 Telegram: https://t.me/Romak04
@@ -17,6 +17,7 @@ import logging
 import webbrowser
 from datetime import datetime
 from collections import defaultdict
+from dataclasses import dataclass, field
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -758,10 +759,20 @@ class Archiver:
         return '\n'.join(lines)
 
 
+@dataclass
+class BatchItem:
+    scene_path: str
+    archive_name: str
+    status: str = "Ожидает"
+    progress: int = 0
+    result: dict = field(default_factory=dict)
+    iid: str = ""
+
+
 class App:
 
     APP_NAME = "Max Scene Packager"
-    VERSION = "2.8"
+    VERSION = "2.9"
     GITHUB = "https://github.com/ziroma4-droid/3ds-Max-Scene-Archiver-v2"
     TELEGRAM = "https://t.me/Romak04"
     EMAIL = "romancg@yandex.ru"
@@ -799,6 +810,12 @@ class App:
         self.archive_var = tk.StringVar()
         self.scene_var.trace_add('write', self.on_scene_path_changed)
         self.organize_var = tk.BooleanVar(value=True)
+        self.batch_output_mode = tk.StringVar(value='alongside')
+        self.batch_output_dir = tk.StringVar()
+        self.batch_items = []
+        self.batch_running = False
+        self.batch_stop_requested = False
+        self.batch_name_editor = None
         
         self.cat_vars = {
             'texture': tk.BooleanVar(value=True),
@@ -954,6 +971,56 @@ class App:
                   indicatorforeground=[('selected', '#FFFFFF')],
                   bordercolor=[('focus', colors['accent'])])
 
+        style.configure('Panel.TRadiobutton',
+                        background=colors['panel'],
+                        foreground=colors['text'],
+                        font=(self.font_family, 9),
+                        padding=(0, 2),
+                        indicatorbackground=colors['surface'],
+                        indicatorforeground='#FFFFFF',
+                        bordercolor=colors['border'])
+        style.map('Panel.TRadiobutton',
+                  background=[('active', colors['panel'])],
+                  foreground=[('disabled', colors['disabled'])],
+                  indicatorbackground=[('selected', colors['accent']),
+                                       ('active', '#30353A')],
+                  indicatorforeground=[('selected', '#FFFFFF')])
+
+        style.configure('Workspace.TNotebook',
+                        background=colors['background'],
+                        borderwidth=0,
+                        tabmargins=(0, 0, 0, 0))
+        style.configure('Workspace.TNotebook.Tab',
+                        background=colors['surface'],
+                        foreground=colors['secondary'],
+                        padding=(16, 8),
+                        borderwidth=0,
+                        font=(self.font_family, 9))
+        style.map('Workspace.TNotebook.Tab',
+                  background=[('selected', colors['panel']), ('active', '#30343A')],
+                  foreground=[('selected', colors['text']), ('active', colors['text'])])
+
+        style.configure('Batch.Treeview',
+                        background=colors['background'],
+                        fieldbackground=colors['background'],
+                        foreground=colors['secondary'],
+                        bordercolor=colors['border'],
+                        rowheight=25,
+                        relief='flat',
+                        font=(self.font_family, 9))
+        style.map('Batch.Treeview',
+                  background=[('selected', '#28446F')],
+                  foreground=[('selected', '#FFFFFF')])
+        style.configure('Batch.Treeview.Heading',
+                        background=colors['surface'],
+                        foreground=colors['text'],
+                        bordercolor=colors['border'],
+                        relief='flat',
+                        padding=(8, 6),
+                        font=(self.font_family, 9))
+        style.map('Batch.Treeview.Heading',
+                  background=[('active', '#30343A')])
+
         style.configure('Industrial.Horizontal.TProgressbar',
                         background=colors['accent'],
                         troughcolor=colors['surface'],
@@ -984,8 +1051,15 @@ class App:
         workspace.columnconfigure(1, weight=2)
         workspace.rowconfigure(0, weight=1)
 
-        file_card = ttk.Frame(workspace, padding=(20, 16), style='Panel.TFrame')
-        file_card.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
+        self.file_notebook = ttk.Notebook(workspace, style='Workspace.TNotebook')
+        self.file_notebook.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
+        self.single_tab = ttk.Frame(self.file_notebook, style='Panel.TFrame')
+        self.batch_tab = ttk.Frame(self.file_notebook, style='Panel.TFrame')
+        self.file_notebook.add(self.single_tab, text='Одна сцена')
+        self.file_notebook.add(self.batch_tab, text='Пакет')
+
+        file_card = ttk.Frame(self.single_tab, padding=(20, 16), style='Panel.TFrame')
+        file_card.pack(fill='both', expand=True)
         file_card.columnconfigure(1, weight=1)
         ttk.Label(file_card, text="Файлы", style='Section.TLabel').grid(
             row=0, column=0, columnspan=3, sticky='w'
@@ -1020,6 +1094,8 @@ class App:
             style='Secondary.TButton',
         ).grid(row=3, column=2, padx=(12, 0), pady=(12, 0))
 
+        self.build_batch_panel(self.batch_tab)
+
         options_card = ttk.Frame(workspace, padding=(20, 16), style='Panel.TFrame')
         options_card.grid(row=0, column=1, sticky='nsew', padx=(8, 0))
         options_card.columnconfigure(0, weight=1)
@@ -1037,23 +1113,33 @@ class App:
         labels = {'texture': 'Текстуры', 'ies': 'IES', 'proxy': 'Прокси',
                  'cache': 'Кэш', 'audio': 'Аудио', 'lut': 'LUT', 'xref': 'XRef'}
 
+        self.category_checkbuttons = []
         for i, (key, label) in enumerate(labels.items()):
-            ttk.Checkbutton(
+            checkbutton = ttk.Checkbutton(
                 options_card,
                 text=label,
                 variable=self.cat_vars[key],
                 style='Panel.TCheckbutton',
-            ).grid(row=2 + i // 2, column=i % 2, sticky='w', padx=(0, 12), pady=1)
+            )
+            checkbutton.grid(
+                row=2 + i // 2,
+                column=i % 2,
+                sticky='w',
+                padx=(0, 12),
+                pady=1,
+            )
+            self.category_checkbuttons.append(checkbutton)
 
         ttk.Separator(options_card).grid(
             row=6, column=0, columnspan=2, sticky='ew', pady=(8, 8)
         )
-        ttk.Checkbutton(
+        self.organize_checkbutton = ttk.Checkbutton(
             options_card,
             text="Структура maps/ и xrefs/",
             variable=self.organize_var,
             style='Panel.TCheckbutton',
-        ).grid(row=7, column=0, columnspan=2, sticky='w')
+        )
+        self.organize_checkbutton.grid(row=7, column=0, columnspan=2, sticky='w')
 
         controls = ttk.Frame(main, style='App.TFrame')
         controls.pack(fill='x', pady=(0, 12))
@@ -1061,20 +1147,41 @@ class App:
         ttk.Label(controls, textvariable=self.status_var, style='Status.TLabel').pack(
             side='left'
         )
+
+        self.single_actions = ttk.Frame(controls, style='App.TFrame')
+        self.single_actions.pack(side='right')
         self.btn_archive = ttk.Button(
-            controls,
+            self.single_actions,
             text="Создать архив",
             command=self.start_archive,
             style='Primary.TButton',
         )
         self.btn_archive.pack(side='right')
         self.btn_analyze = ttk.Button(
-            controls,
+            self.single_actions,
             text="Анализировать",
             command=self.start_analyze,
             style='Secondary.TButton',
         )
         self.btn_analyze.pack(side='right', padx=(0, 8))
+
+        self.batch_actions = ttk.Frame(controls, style='App.TFrame')
+        self.btn_batch_start = ttk.Button(
+            self.batch_actions,
+            text="Архивировать пакет",
+            command=self.start_batch_archive,
+            style='Primary.TButton',
+        )
+        self.btn_batch_start.pack(side='right')
+        self.btn_batch_stop = ttk.Button(
+            self.batch_actions,
+            text="Остановить после текущего",
+            command=self.request_batch_stop,
+            style='Secondary.TButton',
+            state='disabled',
+        )
+        self.btn_batch_stop.pack(side='right', padx=(0, 8))
+        self.file_notebook.bind('<<NotebookTabChanged>>', self.on_mode_changed)
 
         self.progress = ttk.Progressbar(
             main,
@@ -1131,6 +1238,558 @@ class App:
         self.make_link(links, "Telegram", self.TELEGRAM).pack(side='left', padx=(0, 16))
         self.make_link(links, "Email", f"mailto:{self.EMAIL}").pack(side='left')
 
+        self.on_batch_output_mode_changed(reset_statuses=False)
+        self.update_batch_start_label()
+
+    def build_batch_panel(self, parent):
+        colors = self.COLORS
+        panel = ttk.Frame(parent, padding=(16, 12), style='Panel.TFrame')
+        panel.pack(fill='both', expand=True)
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(2, weight=1)
+
+        header = ttk.Frame(panel, style='Panel.TFrame')
+        header.grid(row=0, column=0, sticky='ew')
+        ttk.Label(header, text="Очередь сцен", style='Section.TLabel').pack(side='left')
+        self.btn_batch_add = ttk.Button(
+            header,
+            text="Добавить сцены",
+            command=self.add_batch_scenes,
+            style='Secondary.TButton',
+        )
+        self.btn_batch_add.pack(side='right')
+
+        tools_row = ttk.Frame(panel, style='Panel.TFrame')
+        tools_row.grid(row=1, column=0, sticky='ew', pady=(6, 8))
+        ttk.Label(
+            tools_row,
+            text="Имя ZIP редактируется двойным щелчком",
+            style='PanelMuted.TLabel',
+        ).pack(side='left')
+        self.btn_batch_clear = ttk.Button(
+            tools_row,
+            text="Очистить",
+            command=self.clear_batch_items,
+            style='Quiet.TButton',
+        )
+        self.btn_batch_clear.pack(side='right')
+        self.btn_batch_remove = ttk.Button(
+            tools_row,
+            text="Удалить",
+            command=self.remove_batch_items,
+            style='Quiet.TButton',
+        )
+        self.btn_batch_remove.pack(side='right', padx=(0, 4))
+
+        tree_frame = ttk.Frame(panel, style='Panel.TFrame')
+        tree_frame.grid(row=2, column=0, sticky='nsew')
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+
+        self.batch_tree = ttk.Treeview(
+            tree_frame,
+            columns=('scene', 'archive', 'status'),
+            show='headings',
+            height=4,
+            selectmode='extended',
+            style='Batch.Treeview',
+        )
+        self.batch_tree.heading('scene', text='Сцена')
+        self.batch_tree.heading('archive', text='Имя архива')
+        self.batch_tree.heading('status', text='Статус')
+        self.batch_tree.column('scene', width=210, minwidth=120, stretch=True)
+        self.batch_tree.column('archive', width=165, minwidth=120, stretch=True)
+        self.batch_tree.column('status', width=105, minwidth=90, stretch=False)
+        self.batch_tree.grid(row=0, column=0, sticky='nsew')
+        tree_scroll = ttk.Scrollbar(
+            tree_frame,
+            orient='vertical',
+            command=self.batch_tree.yview,
+        )
+        tree_scroll.grid(row=0, column=1, sticky='ns')
+        self.batch_tree.configure(yscrollcommand=tree_scroll.set)
+        self.batch_tree.bind('<Double-1>', self.begin_batch_name_edit)
+        self.batch_tree.tag_configure('active', foreground=colors['accent'])
+        self.batch_tree.tag_configure('success', foreground=colors['success'])
+        self.batch_tree.tag_configure('warning', foreground=colors['warning'])
+        self.batch_tree.tag_configure('error', foreground=colors['error'])
+        self.batch_tree.tag_configure('muted', foreground=colors['disabled'])
+
+        output = ttk.Frame(panel, style='Panel.TFrame')
+        output.grid(row=3, column=0, sticky='ew', pady=(10, 0))
+        output.columnconfigure(1, weight=1)
+        self.batch_output_radios = []
+        alongside_radio = ttk.Radiobutton(
+            output,
+            text="Сохранять рядом со сценой",
+            value='alongside',
+            variable=self.batch_output_mode,
+            command=self.on_batch_output_mode_changed,
+            style='Panel.TRadiobutton',
+        )
+        alongside_radio.grid(row=0, column=0, columnspan=3, sticky='w')
+        directory_radio = ttk.Radiobutton(
+            output,
+            text="Все архивы в папку",
+            value='directory',
+            variable=self.batch_output_mode,
+            command=self.on_batch_output_mode_changed,
+            style='Panel.TRadiobutton',
+        )
+        directory_radio.grid(row=1, column=0, sticky='w', pady=(4, 0), padx=(0, 8))
+        self.batch_output_radios.extend((alongside_radio, directory_radio))
+        self.batch_output_entry = ttk.Entry(output, textvariable=self.batch_output_dir)
+        self.batch_output_entry.grid(row=1, column=1, sticky='ew', pady=(4, 0))
+        self.btn_batch_output = ttk.Button(
+            output,
+            text="Обзор",
+            command=self.browse_batch_output_dir,
+            style='Secondary.TButton',
+        )
+        self.btn_batch_output.grid(row=1, column=2, padx=(8, 0), pady=(4, 0))
+
+    def on_mode_changed(self, _event=None):
+        if not hasattr(self, 'batch_actions'):
+            return
+        is_batch = self.file_notebook.index('current') == 1
+        if is_batch:
+            self.single_actions.pack_forget()
+            self.batch_actions.pack(side='right')
+        else:
+            self.batch_actions.pack_forget()
+            self.single_actions.pack(side='right')
+
+    @staticmethod
+    def default_batch_archive_name(scene_path):
+        scene_name = os.path.basename(scene_path)
+        return os.path.splitext(scene_name)[0] + "_archive.zip"
+
+    @staticmethod
+    def validate_archive_filename(name):
+        normalized = name.strip()
+        if not normalized:
+            return False, normalized, "Имя архива не может быть пустым."
+        if re.search(r'[<>:"/\\|?*\x00-\x1f]', normalized):
+            return False, normalized, "В имени архива есть недопустимые символы."
+        if normalized.endswith((' ', '.')):
+            return False, normalized, "Имя архива не может заканчиваться пробелом или точкой."
+        if not normalized.lower().endswith('.zip'):
+            normalized += '.zip'
+        stem = os.path.splitext(normalized)[0]
+        reserved = {
+            'CON', 'PRN', 'AUX', 'NUL',
+            'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+            'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9',
+        }
+        if not stem or stem.upper() in reserved:
+            return False, normalized, "Это имя архива недоступно в Windows."
+        return True, normalized, ""
+
+    def add_batch_scenes(self):
+        files = filedialog.askopenfilenames(filetypes=[("3ds Max", "*.max")])
+        if not files:
+            return
+
+        known = {
+            os.path.normcase(os.path.abspath(item.scene_path))
+            for item in self.batch_items
+        }
+        added = 0
+        skipped = 0
+        for scene_path in files:
+            key = os.path.normcase(os.path.abspath(scene_path))
+            if key in known:
+                skipped += 1
+                continue
+            item = BatchItem(
+                scene_path=scene_path,
+                archive_name=self.default_batch_archive_name(scene_path),
+            )
+            item.iid = self.batch_tree.insert(
+                '',
+                'end',
+                values=(item.scene_path, item.archive_name, item.status),
+            )
+            self.batch_items.append(item)
+            known.add(key)
+            added += 1
+
+        self.update_batch_start_label()
+        if added:
+            self.log(f"Пакет: добавлено сцен — {added}")
+        if skipped:
+            self.log(f"Пакет: повторно выбранные сцены пропущены — {skipped}")
+
+    def remove_batch_items(self):
+        selected = set(self.batch_tree.selection())
+        if not selected:
+            return
+        self.batch_items = [item for item in self.batch_items if item.iid not in selected]
+        for iid in selected:
+            if self.batch_tree.exists(iid):
+                self.batch_tree.delete(iid)
+        self.update_batch_start_label()
+
+    def clear_batch_items(self):
+        for iid in self.batch_tree.get_children():
+            self.batch_tree.delete(iid)
+        self.batch_items.clear()
+        self.update_batch_start_label()
+
+    def update_batch_start_label(self):
+        if not hasattr(self, 'btn_batch_start'):
+            return
+        count = len(self.batch_items)
+        text = f"Архивировать: {count}" if count else "Архивировать пакет"
+        self.btn_batch_start.configure(text=text)
+
+    def browse_batch_output_dir(self):
+        directory = filedialog.askdirectory()
+        if directory:
+            self.batch_output_dir.set(directory)
+            self.batch_output_mode.set('directory')
+            self.on_batch_output_mode_changed()
+
+    def on_batch_output_mode_changed(self, reset_statuses=True):
+        if not hasattr(self, 'batch_output_entry'):
+            return
+        directory_mode = self.batch_output_mode.get() == 'directory'
+        state = 'normal' if directory_mode and not self.batch_running else 'disabled'
+        self.batch_output_entry.configure(state=state)
+        self.btn_batch_output.configure(state=state)
+        if reset_statuses and not self.batch_running:
+            for item in self.batch_items:
+                if item.status != "Ожидает":
+                    self.render_batch_item(item, "Ожидает")
+
+    def find_batch_item(self, iid):
+        return next((item for item in self.batch_items if item.iid == iid), None)
+
+    def begin_batch_name_edit(self, event):
+        if self.batch_running or self.batch_tree.identify_region(event.x, event.y) != 'cell':
+            return
+        iid = self.batch_tree.identify_row(event.y)
+        column = self.batch_tree.identify_column(event.x)
+        if not iid or column != '#2':
+            return
+        item = self.find_batch_item(iid)
+        bounds = self.batch_tree.bbox(iid, column)
+        if item is None or not bounds:
+            return
+
+        if self.batch_name_editor is not None:
+            self.batch_name_editor.destroy()
+        x, y, width, height = bounds
+        editor = ttk.Entry(self.batch_tree)
+        editor.insert(0, item.archive_name)
+        editor.select_range(0, 'end')
+        editor.place(x=x, y=y, width=width, height=height)
+        editor.focus_set()
+        self.batch_name_editor = editor
+
+        def finish(commit=True):
+            if self.batch_name_editor is not editor:
+                return
+            value = editor.get()
+            self.batch_name_editor = None
+            editor.destroy()
+            if not commit:
+                return
+            valid, normalized, error = self.validate_archive_filename(value)
+            if not valid:
+                messagebox.showerror("Некорректное имя", error)
+                return
+            item.archive_name = normalized
+            item.result.clear()
+            self.render_batch_item(item, "Ожидает")
+
+        editor.bind('<Return>', lambda _event: finish(True))
+        editor.bind('<Escape>', lambda _event: finish(False))
+        editor.bind('<FocusOut>', lambda _event: finish(True))
+
+    def batch_status_tag(self, status):
+        lowered = status.lower()
+        if lowered.startswith('архивируется'):
+            return 'active'
+        if lowered.startswith('готов с'):
+            return 'warning'
+        if lowered.startswith('готов'):
+            return 'success'
+        if lowered.startswith('ошибка'):
+            return 'error'
+        if lowered.startswith('пропущен'):
+            return 'muted'
+        return ''
+
+    def render_batch_item(self, item, status=None):
+        if status is not None:
+            item.status = status
+        if not self.batch_tree.exists(item.iid):
+            return
+        tag = self.batch_status_tag(item.status)
+        self.batch_tree.item(
+            item.iid,
+            values=(item.scene_path, item.archive_name, item.status),
+            tags=(tag,) if tag else (),
+        )
+
+    def set_batch_item_status(self, item, status, progress=None):
+        item.status = status
+        if progress is not None:
+            item.progress = progress
+        self.root.after(0, lambda: self.render_batch_item(item))
+
+    def set_batch_queue_enabled(self, enabled):
+        state = 'normal' if enabled else 'disabled'
+        for widget in (
+            self.btn_batch_add,
+            self.btn_batch_remove,
+            self.btn_batch_clear,
+            *self.batch_output_radios,
+        ):
+            widget.configure(state=state)
+        self.on_batch_output_mode_changed(reset_statuses=False)
+
+    def prepare_batch_jobs(self):
+        if not self.batch_items:
+            messagebox.showerror("Ошибка", "Добавьте хотя бы одну сцену.")
+            return None
+
+        output_mode = self.batch_output_mode.get()
+        output_dir = self.batch_output_dir.get().strip()
+        errors = []
+        jobs = []
+        destinations = defaultdict(list)
+
+        if output_mode == 'directory':
+            if not output_dir:
+                messagebox.showerror("Ошибка", "Укажите папку для архивов.")
+                return None
+            output_dir = os.path.abspath(output_dir)
+
+        for item in self.batch_items:
+            self.render_batch_item(item, "Ожидает")
+            if not os.path.isfile(item.scene_path):
+                errors.append(f"Файл сцены не найден: {item.scene_path}")
+                self.render_batch_item(item, "Ошибка: сцена не найдена")
+                continue
+            if os.path.splitext(item.scene_path)[1].lower() != '.max':
+                errors.append(f"Неподдерживаемый файл: {item.scene_path}")
+                self.render_batch_item(item, "Ошибка: не .max")
+                continue
+
+            valid, normalized, error = self.validate_archive_filename(item.archive_name)
+            if not valid:
+                errors.append(f"{os.path.basename(item.scene_path)}: {error}")
+                self.render_batch_item(item, "Ошибка: имя ZIP")
+                continue
+            item.archive_name = normalized
+            target_dir = (
+                output_dir
+                if output_mode == 'directory'
+                else os.path.dirname(item.scene_path)
+            )
+            archive_path = os.path.abspath(os.path.join(target_dir, item.archive_name))
+            key = os.path.normcase(archive_path)
+            destinations[key].append(item)
+            jobs.append((item, archive_path))
+
+        duplicate_keys = {key for key, items in destinations.items() if len(items) > 1}
+        if duplicate_keys:
+            for key in duplicate_keys:
+                names = ', '.join(os.path.basename(item.scene_path) for item in destinations[key])
+                errors.append(f"Одинаковый путь архива: {key} ({names})")
+                for item in destinations[key]:
+                    self.render_batch_item(item, "Ошибка: совпадает имя")
+
+        if errors:
+            preview = '\n'.join(errors[:8])
+            if len(errors) > 8:
+                preview += f"\n…и ещё {len(errors) - 8}"
+            messagebox.showerror("Пакет не готов", preview)
+            return None
+
+        if output_mode == 'directory':
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror("Ошибка папки", str(exc))
+                return None
+
+        for item, archive_path in jobs:
+            if os.path.isdir(archive_path):
+                self.render_batch_item(item, "Ошибка: путь занят папкой")
+                messagebox.showerror(
+                    "Пакет не готов",
+                    f"Путь архива занят папкой:\n{archive_path}",
+                )
+                return None
+        return jobs
+
+    def start_batch_archive(self):
+        if self.batch_running:
+            return
+        jobs = self.prepare_batch_jobs()
+        if jobs is None:
+            return
+
+        existing = [(item, path) for item, path in jobs if os.path.isfile(path)]
+        skipped_existing = 0
+        if existing:
+            choice = messagebox.askyesnocancel(
+                "Архивы уже существуют",
+                f"Найдено существующих архивов: {len(existing)}.\n\n"
+                "Да — заменить их\nНет — пропустить\nОтмена — вернуться к списку",
+            )
+            if choice is None:
+                return
+            if not choice:
+                existing_paths = {os.path.normcase(path) for _item, path in existing}
+                filtered = []
+                for item, path in jobs:
+                    if os.path.normcase(path) in existing_paths:
+                        self.render_batch_item(item, "Пропущен: архив существует")
+                        skipped_existing += 1
+                    else:
+                        filtered.append((item, path))
+                jobs = filtered
+
+        if not jobs:
+            self.set_status("Пакет: все архивы пропущены")
+            messagebox.showinfo("Пакет завершён", "Все архивы уже существуют и были пропущены.")
+            return
+
+        categories = {key: var.get() for key, var in self.cat_vars.items()}
+        organize = self.organize_var.get()
+        self.batch_running = True
+        self.batch_stop_requested = False
+        self.set_batch_queue_enabled(False)
+        self.set_enabled(False)
+        self.btn_batch_stop.configure(state='normal', text="Остановить после текущего")
+        self.file_notebook.tab(self.single_tab, state='disabled')
+        self.set_progress(0)
+        self.set_status(f"Пакет: 0 из {len(jobs)}")
+        self.log(f"Пакетная обработка: сцен — {len(jobs)}")
+        threading.Thread(
+            target=self.do_batch_archive,
+            args=(jobs, categories, organize, skipped_existing),
+            daemon=True,
+        ).start()
+
+    def request_batch_stop(self):
+        if not self.batch_running or self.batch_stop_requested:
+            return
+        self.batch_stop_requested = True
+        self.btn_batch_stop.configure(state='disabled', text="Остановка после текущего…")
+        self.set_status("Пакет: остановка после текущего архива")
+        self.log("Пакет: запрошена остановка после текущего архива")
+
+    def do_batch_archive(self, jobs, categories, organize, skipped_existing):
+        total = len(jobs)
+        summary = {
+            'ready': 0,
+            'warnings': 0,
+            'errors': 0,
+            'skipped': skipped_existing,
+        }
+        processed = 0
+
+        for position, (item, archive_path) in enumerate(jobs, 1):
+            if self.batch_stop_requested:
+                break
+
+            scene_name = os.path.basename(item.scene_path)
+            prefix = f"[{position}/{total}] {scene_name}"
+            self.set_batch_item_status(item, "Архивируется · 0%", 0)
+            last_progress = {'value': -1}
+
+            def update_progress(value, current=item, number=position, name=scene_name):
+                value = max(0, min(100, int(value)))
+                if value == last_progress['value']:
+                    return
+                last_progress['value'] = value
+                overall = ((number - 1) + value / 100.0) / total * 100
+                self.set_progress(overall)
+                self.set_status(
+                    f"Пакет: готово {number - 1} из {total} · {name} · {value}%"
+                )
+                self.set_batch_item_status(current, f"Архивируется · {value}%", value)
+
+            batch_archiver = Archiver(
+                lambda msg, current_prefix=prefix: self.log(msg, current_prefix)
+            )
+            ok, count, size, stats = batch_archiver.create(
+                item.scene_path,
+                archive_path,
+                categories,
+                organize,
+                update_progress,
+            )
+            processed += 1
+            item.result = {
+                'ok': ok,
+                'archive_path': archive_path,
+                'count': count,
+                'size': size,
+                'stats': stats,
+            }
+
+            if not ok:
+                summary['errors'] += 1
+                self.set_batch_item_status(item, "Ошибка", 100)
+            elif stats['missing'] or stats['errors']:
+                summary['warnings'] += 1
+                self.set_batch_item_status(item, "Готов с предупреждениями", 100)
+            else:
+                summary['ready'] += 1
+                self.set_batch_item_status(item, "Готов", 100)
+
+            self.set_progress(position / total * 100)
+            if self.batch_stop_requested:
+                break
+
+        stopped = self.batch_stop_requested and processed < total
+        remaining = total - processed
+        self.root.after(
+            0,
+            lambda: self.finish_batch_archive(summary, stopped, remaining),
+        )
+
+    def finish_batch_archive(self, summary, stopped, remaining):
+        self.batch_running = False
+        self.batch_stop_requested = False
+        self.set_batch_queue_enabled(True)
+        self.set_enabled(True)
+        self.btn_batch_stop.configure(state='disabled', text="Остановить после текущего")
+        self.file_notebook.tab(self.single_tab, state='normal')
+
+        completed = summary['ready'] + summary['warnings'] + summary['errors']
+        if stopped:
+            self.set_status(f"Пакет остановлен · обработано {completed}, осталось {remaining}")
+        else:
+            self.set_progress(100)
+            self.set_status(
+                f"Пакет завершён · готово {summary['ready']}, "
+                f"предупреждений {summary['warnings']}, ошибок {summary['errors']}"
+            )
+
+        lines = [
+            "Пакетная обработка остановлена." if stopped else "Пакетная обработка завершена.",
+            "",
+            f"Готово: {summary['ready']}",
+            f"С предупреждениями: {summary['warnings']}",
+            f"Ошибок: {summary['errors']}",
+            f"Пропущено: {summary['skipped']}",
+        ]
+        if stopped:
+            lines.append(f"Осталось в очереди: {remaining}")
+        lines.extend(("", "Подробности находятся в журнале и _report.txt."))
+        text = '\n'.join(lines)
+        if stopped or summary['warnings'] or summary['errors']:
+            messagebox.showwarning("Результат пакетной обработки", text)
+        else:
+            messagebox.showinfo("Пакет завершён", text)
+
     def make_link(self, parent, text, url):
         link = tk.Label(
             parent,
@@ -1169,10 +1828,11 @@ class App:
         if f:
             self.archive_var.set(f)
     
-    def log(self, msg):
+    def log(self, msg, prefix=None):
         def update():
             ts = datetime.now().strftime("%H:%M:%S")
             self.log_text.insert('end', f"[{ts}] ", 'timestamp')
+            display_msg = f"{prefix} — {msg}" if prefix else msg
             lowered = msg.lower()
             if 'ошиб' in lowered or msg.lstrip().startswith('✗'):
                 tag = 'error'
@@ -1182,7 +1842,7 @@ class App:
                 tag = 'success'
             else:
                 tag = None
-            self.log_text.insert('end', f"{msg}\n", tag)
+            self.log_text.insert('end', f"{display_msg}\n", tag)
             self.log_text.see('end')
         self.root.after(0, update)
     
@@ -1197,10 +1857,14 @@ class App:
     
     def set_enabled(self, enabled):
         state = 'normal' if enabled else 'disabled'
-        self.root.after(0, lambda: (
-            self.btn_archive.configure(state=state),
-            self.btn_analyze.configure(state=state),
-        ))
+        def update():
+            self.btn_archive.configure(state=state)
+            self.btn_analyze.configure(state=state)
+            self.btn_batch_start.configure(state=state)
+            self.organize_checkbutton.configure(state=state)
+            for checkbutton in self.category_checkbuttons:
+                checkbutton.configure(state=state)
+        self.root.after(0, update)
     
     def start_analyze(self):
         if not self.scene_var.get():
