@@ -1,3 +1,5 @@
 max_archiver.log
 build/
 __pycache__/
+batch_test_*/
+conversion_test_*/

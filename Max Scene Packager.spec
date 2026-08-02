@@ -9,6 +9,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 datas += [
     ('assets/app-icon.png', 'assets'),
     ('assets/app-icon.ico', 'assets'),
+    ('assets/convert_max_version.ms', 'assets'),
 ]
 
 

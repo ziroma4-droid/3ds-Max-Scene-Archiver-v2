@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Max Scene Packager v2.9
+Max Scene Packager v3.0
 Автор: @RomanCG
 GitHub: https://github.com/ziroma4-droid/3ds-Max-Scene-Archiver-v2
 Telegram: https://t.me/Romak04
@@ -15,6 +15,9 @@ import glob
 import zipfile
 import logging
 import webbrowser
+import subprocess
+import tempfile
+import time
 from datetime import datetime
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -22,6 +25,11 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
+
+try:
+    import winreg
+except ImportError:
+    winreg = None
 
 try:
     import olefile
@@ -55,6 +63,389 @@ def enable_dpi_awareness():
         return bool(ctypes.windll.user32.SetProcessDPIAware())
     except (AttributeError, OSError):
         return False
+
+
+@dataclass(frozen=True)
+class MaxInstallation:
+    year: int
+    install_dir: str
+    max_exe: str
+    batch_exe: str = ""
+    product_version: str = ""
+
+    @property
+    def launcher(self):
+        return self.batch_exe if self.batch_exe else self.max_exe
+
+    @property
+    def display_name(self):
+        mode = "Batch" if self.batch_exe else "совместимый режим"
+        return f"3ds Max {self.year} · {mode}"
+
+    @property
+    def target_versions(self):
+        first = self.year - 1
+        last = max(2010, self.year - 3)
+        if first < 2010:
+            return []
+        return list(range(first, last - 1, -1))
+
+
+@dataclass(frozen=True)
+class ConversionSettings:
+    enabled: bool = False
+    installation: MaxInstallation = None
+    target_version: int = None
+
+
+@dataclass
+class ConvertedScene:
+    source_path: str
+    converted_path: str
+    target_version: int
+    duration_seconds: float
+    file_version_data: tuple = ()
+    warnings: list = field(default_factory=list)
+
+
+def windows_file_product_version(filepath):
+    """Return (version string, product major) from a Windows executable."""
+    if sys.platform != 'win32' or not os.path.isfile(filepath):
+        return "", None
+
+    class VSFixedFileInfo(ctypes.Structure):
+        _fields_ = [
+            ('dwSignature', ctypes.c_uint32),
+            ('dwStrucVersion', ctypes.c_uint32),
+            ('dwFileVersionMS', ctypes.c_uint32),
+            ('dwFileVersionLS', ctypes.c_uint32),
+            ('dwProductVersionMS', ctypes.c_uint32),
+            ('dwProductVersionLS', ctypes.c_uint32),
+            ('dwFileFlagsMask', ctypes.c_uint32),
+            ('dwFileFlags', ctypes.c_uint32),
+            ('dwFileOS', ctypes.c_uint32),
+            ('dwFileType', ctypes.c_uint32),
+            ('dwFileSubtype', ctypes.c_uint32),
+            ('dwFileDateMS', ctypes.c_uint32),
+            ('dwFileDateLS', ctypes.c_uint32),
+        ]
+
+    try:
+        handle = ctypes.c_uint32(0)
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(filepath, ctypes.byref(handle))
+        if not size:
+            return "", None
+        buffer = ctypes.create_string_buffer(size)
+        if not ctypes.windll.version.GetFileVersionInfoW(filepath, 0, size, buffer):
+            return "", None
+        value = ctypes.c_void_p()
+        value_size = ctypes.c_uint32(0)
+        if not ctypes.windll.version.VerQueryValueW(
+            buffer, "\\", ctypes.byref(value), ctypes.byref(value_size)
+        ):
+            return "", None
+        info = ctypes.cast(value, ctypes.POINTER(VSFixedFileInfo)).contents
+        values = (
+            info.dwProductVersionMS >> 16,
+            info.dwProductVersionMS & 0xFFFF,
+            info.dwProductVersionLS >> 16,
+            info.dwProductVersionLS & 0xFFFF,
+        )
+        return '.'.join(str(value) for value in values), values[0]
+    except (AttributeError, OSError, ValueError):
+        return "", None
+
+
+def max_installation_from_path(path):
+    path = os.path.abspath(path)
+    install_dir = path if os.path.isdir(path) else os.path.dirname(path)
+    max_exe = os.path.join(install_dir, '3dsmax.exe')
+    if os.path.isfile(path) and os.path.basename(path).lower() == '3dsmax.exe':
+        max_exe = path
+    if not os.path.isfile(max_exe):
+        return None
+
+    product_version, product_major = windows_file_product_version(max_exe)
+    year = product_major + 1998 if product_major is not None else None
+    if year is None or not 2010 <= year <= 2100:
+        match = re.search(r'3ds\s+max\s+(\d{4})', install_dir, re.IGNORECASE)
+        year = int(match.group(1)) if match else None
+    if year is None:
+        return None
+
+    batch_exe = os.path.join(install_dir, '3dsmaxbatch.exe')
+    return MaxInstallation(
+        year=year,
+        install_dir=install_dir,
+        max_exe=max_exe,
+        batch_exe=batch_exe if os.path.isfile(batch_exe) else "",
+        product_version=product_version,
+    )
+
+
+def registry_max_install_locations():
+    if winreg is None:
+        return []
+
+    locations = []
+    uninstall_keys = (
+        r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+    )
+    access_modes = [winreg.KEY_READ]
+    if hasattr(winreg, 'KEY_WOW64_64KEY'):
+        access_modes.extend((
+            winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+            winreg.KEY_READ | winreg.KEY_WOW64_32KEY,
+        ))
+
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for key_name in uninstall_keys:
+            for access in access_modes:
+                try:
+                    with winreg.OpenKey(hive, key_name, 0, access) as key:
+                        count = winreg.QueryInfoKey(key)[0]
+                        for index in range(count):
+                            try:
+                                sub_name = winreg.EnumKey(key, index)
+                                with winreg.OpenKey(key, sub_name) as sub_key:
+                                    display_name = winreg.QueryValueEx(
+                                        sub_key, 'DisplayName'
+                                    )[0]
+                                    if not re.search(
+                                        r'Autodesk\s+3ds\s+Max\s+\d{4}',
+                                        str(display_name),
+                                        re.IGNORECASE,
+                                    ):
+                                        continue
+                                    install_location = winreg.QueryValueEx(
+                                        sub_key, 'InstallLocation'
+                                    )[0]
+                                    if install_location:
+                                        locations.append(str(install_location))
+                            except (OSError, ValueError):
+                                continue
+                except OSError:
+                    continue
+    return locations
+
+
+def discover_max_installations():
+    candidates = set(registry_max_install_locations())
+
+    for name, value in os.environ.items():
+        if name.upper().startswith('ADSK_3DSMAX_X64_') and value:
+            candidates.add(value)
+
+    for program_files_name in ('ProgramFiles', 'ProgramFiles(x86)'):
+        program_files = os.environ.get(program_files_name)
+        if not program_files:
+            continue
+        candidates.update(
+            glob.glob(os.path.join(program_files, 'Autodesk', '3ds Max *'))
+        )
+
+    installations = {}
+    for candidate in candidates:
+        installation = max_installation_from_path(candidate)
+        if installation is None:
+            continue
+        key = os.path.normcase(os.path.abspath(installation.max_exe))
+        installations[key] = installation
+
+    return sorted(
+        installations.values(),
+        key=lambda item: (item.year, item.install_dir.casefold()),
+        reverse=True,
+    )
+
+
+class MaxVersionConverter:
+
+    TIMEOUT_SECONDS = 30 * 60
+
+    def __init__(self, template_path, log_func=None):
+        self.template_path = template_path
+        self.log_func = log_func
+
+    def log(self, message):
+        if self.log_func:
+            self.log_func(message)
+
+    @staticmethod
+    def maxscript_verbatim(value):
+        if '"' in value:
+            raise ValueError('Путь с кавычкой не поддерживается 3ds Max Batch.')
+        return value
+
+    @staticmethod
+    def read_result(path):
+        result = {}
+        if not os.path.isfile(path):
+            return result
+        with open(path, 'r', encoding='utf-8-sig', errors='replace') as result_file:
+            for line in result_file:
+                key, separator, value = line.rstrip('\r\n').partition('=')
+                if separator:
+                    result[key] = value
+        return result
+
+    @staticmethod
+    def read_session_warnings(path):
+        if not os.path.isfile(path):
+            return []
+        warnings = []
+        with open(path, 'r', encoding='utf-8', errors='replace') as log_file:
+            for line in log_file:
+                lowered = line.lower()
+                if 'missing dll:' in lowered or 'missing class:' in lowered:
+                    message = line.strip()
+                    if message and message not in warnings:
+                        warnings.append(message)
+        return warnings
+
+    @staticmethod
+    def terminate_process_tree(process):
+        if process.poll() is not None:
+            return
+        if sys.platform == 'win32':
+            subprocess.run(
+                ['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+                check=False,
+            )
+        else:
+            process.kill()
+
+    def make_job_script(self, source_path, output_path, result_path, job_path, target):
+        with open(self.template_path, 'r', encoding='utf-8-sig') as template_file:
+            script = template_file.read()
+        replacements = {
+            '__SOURCE_PATH__': self.maxscript_verbatim(source_path),
+            '__OUTPUT_PATH__': self.maxscript_verbatim(output_path),
+            '__RESULT_PATH__': self.maxscript_verbatim(result_path),
+            '__TARGET_VERSION__': str(target),
+        }
+        for marker, value in replacements.items():
+            script = script.replace(marker, value)
+        with open(job_path, 'w', encoding='utf-8-sig', newline='\n') as job_file:
+            job_file.write(script)
+
+    def convert(self, source_path, output_path, installation, target_version):
+        started = time.monotonic()
+        work_dir = os.path.dirname(output_path)
+        os.makedirs(work_dir, exist_ok=True)
+        result_path = os.path.join(work_dir, 'conversion_result.txt')
+        job_path = os.path.join(work_dir, 'convert_job.ms')
+        session_log = os.path.join(work_dir, '3dsmax_session.log')
+        listener_log = os.path.join(work_dir, 'maxscript_listener.log')
+        self.make_job_script(
+            os.path.abspath(source_path),
+            os.path.abspath(output_path),
+            os.path.abspath(result_path),
+            os.path.abspath(job_path),
+            target_version,
+        )
+
+        if installation.batch_exe:
+            command = [
+                installation.batch_exe,
+                job_path,
+                '-v', '2',
+                '-dm', 'on',
+                '-log', session_log,
+                '-listenerlog', listener_log,
+            ]
+            if installation.year >= 2022:
+                command.extend(('-safescene', 'ON'))
+        else:
+            command = [
+                installation.max_exe,
+                '-q',
+                '-mi',
+                '-silent',
+                '-U', 'MAXScript', job_path,
+            ]
+
+        self.log(
+            f"Запуск 3ds Max {installation.year}: "
+            f"сохранение для версии {target_version}"
+        )
+        creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=installation.install_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors='replace',
+                creationflags=creation_flags,
+            )
+            try:
+                process_output, _unused_stderr = process.communicate(
+                    timeout=self.TIMEOUT_SECONDS
+                )
+            except subprocess.TimeoutExpired as exc:
+                self.terminate_process_tree(process)
+                process.communicate()
+                raise RuntimeError(
+                    f"3ds Max не завершил пересохранение за "
+                    f"{self.TIMEOUT_SECONDS // 60} минут."
+                ) from exc
+        except RuntimeError:
+            raise
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"3ds Max не завершил пересохранение за "
+                f"{self.TIMEOUT_SECONDS // 60} минут."
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"Не удалось запустить 3ds Max: {exc}") from exc
+
+        result = self.read_result(result_path)
+        if result.get('status') != 'success' or not os.path.isfile(output_path):
+            message = result.get('message') or f"код завершения {process.returncode}"
+            output_tail = (process_output or '').strip().splitlines()[-5:]
+            if output_tail:
+                message += "; " + ' | '.join(output_tail)
+            raise RuntimeError(f"Пересохранение не выполнено: {message}")
+        if os.path.getsize(output_path) == 0:
+            raise RuntimeError("3ds Max создал пустой файл сцены.")
+
+        version_data = ()
+        try:
+            file_version = int(result['file_version'])
+            saved_by_version = int(result['saved_by_version'])
+            version_data = (file_version, saved_by_version)
+            expected_file_version = (target_version - 1998) * 1000
+            if file_version != expected_file_version:
+                raise RuntimeError(
+                    f"Проверка версии не пройдена: ожидалось "
+                    f"{expected_file_version}, получено {file_version}."
+                )
+        except KeyError:
+            # getMaxFileVersionData is unavailable in 3ds Max 2011/2012.
+            version_data = ()
+
+        duration = time.monotonic() - started
+        warnings = self.read_session_warnings(session_log)
+        for warning in warnings:
+            self.log(f"Предупреждение 3ds Max: {warning}")
+        self.log(
+            f"Пересохранено для 3ds Max {target_version}: "
+            f"{os.path.basename(source_path)} ({duration:.1f} сек.)"
+        )
+        return ConvertedScene(
+            source_path=source_path,
+            converted_path=output_path,
+            target_version=target_version,
+            duration_seconds=duration,
+            file_version_data=version_data,
+            warnings=warnings,
+        )
 
 
 class PathExtractor:
@@ -608,9 +999,30 @@ class Archiver:
                 return arcname
             counter += 1
     
-    def create(self, scene_path, archive_path, categories, organize=True, progress_func=None):
+    def create(
+        self,
+        scene_path,
+        archive_path,
+        categories,
+        organize=True,
+        progress_func=None,
+        archive_scene_path=None,
+        archive_scene_name=None,
+        file_overrides=None,
+        conversion_info=None,
+    ):
         
-        stats = {'added': 0, 'resources': 0, 'missing': 0, 'errors': []}
+        stats = {
+            'added': 0,
+            'resources': 0,
+            'missing': 0,
+            'errors': [],
+            'conversion': conversion_info,
+            'conversion_warnings': len(
+                conversion_info.get('warnings', []) if conversion_info else []
+            ),
+        }
+        file_overrides = file_overrides or {}
         
         try:
             self.log("=" * 40)
@@ -645,8 +1057,9 @@ class Archiver:
             with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 
                 # Сцена
-                scene_name = os.path.basename(scene_path)
-                zf.write(scene_path, scene_name)
+                scene_source = archive_scene_path or scene_path
+                scene_name = archive_scene_name or os.path.basename(scene_path)
+                zf.write(scene_source, scene_name)
                 stats['added'] += 1
                 self.log(f"+ {scene_name}")
                 
@@ -666,7 +1079,9 @@ class Archiver:
                         fname = os.path.basename(fpath)
                         arcname = self.make_archive_name(fname, organize, used_names, cat)
                         
-                        zf.write(fpath, arcname)
+                        override_key = os.path.normcase(os.path.abspath(fpath))
+                        archive_source = file_overrides.get(override_key, fpath)
+                        zf.write(archive_source, arcname)
                         used_names.add(arcname.lower())
                         archived[cat].add(fpath)
                         stats['added'] += 1
@@ -684,7 +1099,7 @@ class Archiver:
                 # Отчёт
                 report = self.make_report(
                     scene_path, archive_path, archived, missing, categories,
-                    stats['errors'], stats['resources']
+                    stats['errors'], stats['resources'], conversion_info,
                 )
                 zf.writestr("_report.txt", report.encode('utf-8'))
                 stats['added'] += 1
@@ -712,7 +1127,15 @@ class Archiver:
             return False, 0, 0, stats
     
     def make_report(
-        self, scene, archive, archived, missing, categories, errors, resource_count
+        self,
+        scene,
+        archive,
+        archived,
+        missing,
+        categories,
+        errors,
+        resource_count,
+        conversion_info=None,
     ):
         lines = [
             "=" * 50,
@@ -724,6 +1147,27 @@ class Archiver:
             f"Архив: {archive}",
             f"Ресурсов добавлено: {resource_count}",
             "",
+        ]
+
+        if conversion_info:
+            lines.extend([
+                "-" * 50,
+                "ПЕРЕСОХРАНЕНИЕ:",
+                f"Запущен 3ds Max: {conversion_info['runtime_version']}",
+                f"Целевая версия: {conversion_info['target_version']}",
+                f"Исполняемый файл: {conversion_info['runtime_path']}",
+                f"Сцена в архиве: {conversion_info['scene_name']}",
+                f"XRef пересохранено: {conversion_info['xref_count']}",
+                f"Время пересохранения: {conversion_info['duration_seconds']:.1f} сек.",
+                "",
+            ])
+            if conversion_info.get('warnings'):
+                lines.append("ПРЕДУПРЕЖДЕНИЯ 3DS MAX:")
+                for warning in conversion_info['warnings']:
+                    lines.append(f"  {warning}")
+                lines.append("")
+
+        lines.extend([
             "Автор: @RomanCG",
             "GitHub: https://github.com/ziroma4-droid/3ds-Max-Scene-Archiver-v2",
             "Telegram: https://t.me/Romak04",
@@ -731,7 +1175,7 @@ class Archiver:
             "",
             "-" * 50,
             "ДОБАВЛЕНО:",
-        ]
+        ])
         
         for cat, paths in archived.items():
             if categories.get(cat, False) and paths:
@@ -772,7 +1216,7 @@ class BatchItem:
 class App:
 
     APP_NAME = "Max Scene Packager"
-    VERSION = "2.9"
+    VERSION = "3.0"
     GITHUB = "https://github.com/ziroma4-droid/3ds-Max-Scene-Archiver-v2"
     TELEGRAM = "https://t.me/Romak04"
     EMAIL = "romancg@yandex.ru"
@@ -797,8 +1241,8 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(f"{self.APP_NAME} v{self.VERSION}")
-        self.root.geometry("960x760")
-        self.root.minsize(840, 680)
+        self.root.geometry("1000x840")
+        self.root.minsize(860, 700)
         self.root.configure(bg=self.COLORS['background'])
         self.set_window_icon()
 
@@ -810,6 +1254,13 @@ class App:
         self.archive_var = tk.StringVar()
         self.scene_var.trace_add('write', self.on_scene_path_changed)
         self.organize_var = tk.BooleanVar(value=True)
+        self.convert_version_var = tk.BooleanVar(value=False)
+        self.max_install_var = tk.StringVar()
+        self.target_version_var = tk.StringVar()
+        self.conversion_message_var = tk.StringVar()
+        self.max_installations = []
+        self.max_install_lookup = {}
+        self.max_scan_complete = False
         self.batch_output_mode = tk.StringVar(value='alongside')
         self.batch_output_dir = tk.StringVar()
         self.batch_items = []
@@ -828,6 +1279,10 @@ class App:
         }
         
         self.archiver = Archiver(self.log)
+        self.converter = MaxVersionConverter(
+            self.resource_path(os.path.join('assets', 'convert_max_version.ms')),
+            self.log,
+        )
         self.build_ui()
 
     @staticmethod
@@ -892,6 +1347,10 @@ class App:
                         background=colors['panel'],
                         foreground=colors['secondary'],
                         font=(self.font_family, 9))
+        style.configure('PanelWarning.TLabel',
+                        background=colors['panel'],
+                        foreground=colors['warning'],
+                        font=(self.font_family, 9))
         style.configure('Status.TLabel',
                         background=colors['background'],
                         foreground=colors['secondary'],
@@ -911,6 +1370,22 @@ class App:
                   lightcolor=[('focus', colors['accent'])],
                   darkcolor=[('focus', colors['accent'])],
                   foreground=[('disabled', colors['disabled'])])
+
+        style.configure('TCombobox',
+                        fieldbackground=colors['surface'],
+                        background=colors['surface'],
+                        foreground=colors['text'],
+                        arrowcolor=colors['secondary'],
+                        bordercolor=colors['border'],
+                        lightcolor=colors['border'],
+                        darkcolor=colors['border'],
+                        padding=(8, 6))
+        style.map('TCombobox',
+                  fieldbackground=[('readonly', colors['surface']),
+                                   ('disabled', colors['panel'])],
+                  foreground=[('readonly', colors['text']),
+                              ('disabled', colors['disabled'])],
+                  bordercolor=[('focus', colors['accent'])])
 
         style.configure('Secondary.TButton',
                         background=colors['surface'],
@@ -1141,6 +1616,83 @@ class App:
         )
         self.organize_checkbutton.grid(row=7, column=0, columnspan=2, sticky='w')
 
+        ttk.Separator(options_card).grid(
+            row=8, column=0, columnspan=2, sticky='ew', pady=(8, 8)
+        )
+        self.convert_checkbutton = ttk.Checkbutton(
+            options_card,
+            text="Пересохранить для старой версии",
+            variable=self.convert_version_var,
+            command=self.on_conversion_toggled,
+            style='Panel.TCheckbutton',
+        )
+        self.convert_checkbutton.grid(row=9, column=0, columnspan=2, sticky='w')
+
+        self.conversion_frame = ttk.Frame(options_card, style='Panel.TFrame')
+        self.conversion_frame.grid(
+            row=10,
+            column=0,
+            columnspan=2,
+            sticky='ew',
+            pady=(8, 0),
+        )
+        self.conversion_frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            self.conversion_frame,
+            text="Запускать",
+            style='PanelMuted.TLabel',
+        ).grid(row=0, column=0, sticky='w', padx=(0, 8))
+        self.max_install_combo = ttk.Combobox(
+            self.conversion_frame,
+            textvariable=self.max_install_var,
+            state='readonly',
+            width=23,
+        )
+        self.max_install_combo.grid(row=0, column=1, sticky='ew')
+        self.max_install_combo.bind('<<ComboboxSelected>>', self.on_max_install_selected)
+        self.btn_browse_max = ttk.Button(
+            self.conversion_frame,
+            text="EXE",
+            command=self.browse_max_executable,
+            style='Quiet.TButton',
+        )
+        self.btn_browse_max.grid(row=0, column=2, padx=(4, 0))
+
+        ttk.Label(
+            self.conversion_frame,
+            text="Формат",
+            style='PanelMuted.TLabel',
+        ).grid(row=1, column=0, sticky='w', padx=(0, 8), pady=(6, 0))
+        self.target_version_combo = ttk.Combobox(
+            self.conversion_frame,
+            textvariable=self.target_version_var,
+            state='readonly',
+            width=23,
+        )
+        self.target_version_combo.grid(
+            row=1,
+            column=1,
+            columnspan=2,
+            sticky='ew',
+            pady=(6, 0),
+        )
+        ttk.Label(
+            self.conversion_frame,
+            textvariable=self.conversion_message_var,
+            style='PanelMuted.TLabel',
+            wraplength=300,
+        ).grid(row=2, column=0, columnspan=3, sticky='w', pady=(7, 0))
+        ttk.Label(
+            self.conversion_frame,
+            text=(
+                "⚠ Будет запущен 3ds Max. Использование CPU и памяти, "
+                "а также время упаковки увеличатся."
+            ),
+            style='PanelWarning.TLabel',
+            wraplength=300,
+        ).grid(row=3, column=0, columnspan=3, sticky='w', pady=(5, 0))
+        self.conversion_frame.grid_remove()
+
         controls = ttk.Frame(main, style='App.TFrame')
         controls.pack(fill='x', pady=(0, 12))
         self.status_var = tk.StringVar(value="Готов")
@@ -1240,6 +1792,130 @@ class App:
 
         self.on_batch_output_mode_changed(reset_statuses=False)
         self.update_batch_start_label()
+
+    def on_conversion_toggled(self):
+        if self.convert_version_var.get():
+            self.conversion_frame.grid()
+            if not self.max_scan_complete:
+                self.refresh_max_installations()
+            else:
+                self.update_conversion_controls()
+        else:
+            self.conversion_frame.grid_remove()
+
+    def refresh_max_installations(self):
+        self.max_installations = discover_max_installations()
+        self.max_scan_complete = True
+        self.rebuild_max_install_lookup()
+        self.update_conversion_controls()
+
+    def rebuild_max_install_lookup(self, preferred=None):
+        self.max_install_lookup = {}
+        values = []
+        for installation in self.max_installations:
+            label = f"3ds Max {installation.year}"
+            if any(existing.startswith(label) for existing in values):
+                label = f"{label} · {installation.install_dir}"
+            values.append(label)
+            self.max_install_lookup[label] = installation
+        self.max_install_combo.configure(values=values)
+
+        selected_label = None
+        if preferred is not None:
+            for label, installation in self.max_install_lookup.items():
+                if os.path.normcase(installation.max_exe) == os.path.normcase(
+                    preferred.max_exe
+                ):
+                    selected_label = label
+                    break
+        if selected_label is None and values:
+            selected_label = values[0]
+        self.max_install_var.set(selected_label or "")
+
+    def update_conversion_controls(self):
+        installation = self.max_install_lookup.get(self.max_install_var.get())
+        if installation is None:
+            self.max_install_combo.configure(state='disabled')
+            self.target_version_combo.configure(state='disabled', values=())
+            self.target_version_var.set("")
+            self.conversion_message_var.set(
+                "3ds Max не найден. Укажите установленный 3dsmax.exe."
+            )
+            return
+
+        self.max_install_combo.configure(state='readonly')
+        targets = [f"3ds Max {year}" for year in installation.target_versions]
+        self.target_version_combo.configure(
+            state='readonly' if targets else 'disabled',
+            values=targets,
+        )
+        if self.target_version_var.get() not in targets:
+            self.target_version_var.set(targets[0] if targets else "")
+
+        launcher_name = (
+            '3dsmaxbatch.exe' if installation.batch_exe else '3dsmax.exe'
+        )
+        if targets:
+            self.conversion_message_var.set(
+                f"Найден 3ds Max {installation.year} ({launcher_name}). "
+                "Основная сцена и .max-XRef будут пересохранены."
+            )
+        else:
+            self.conversion_message_var.set(
+                f"3ds Max {installation.year} не поддерживает сохранение назад."
+            )
+
+    def on_max_install_selected(self, _event=None):
+        self.update_conversion_controls()
+
+    def browse_max_executable(self):
+        filename = filedialog.askopenfilename(
+            title="Укажите 3dsmax.exe",
+            filetypes=[("3ds Max", "3dsmax.exe"), ("EXE", "*.exe")],
+        )
+        if not filename:
+            return
+        installation = max_installation_from_path(filename)
+        if installation is None:
+            messagebox.showerror(
+                "3ds Max не найден",
+                "Не удалось определить версию выбранного 3dsmax.exe.",
+            )
+            return
+        known = {
+            os.path.normcase(os.path.abspath(item.max_exe))
+            for item in self.max_installations
+        }
+        if os.path.normcase(os.path.abspath(installation.max_exe)) not in known:
+            self.max_installations.append(installation)
+            self.max_installations.sort(key=lambda item: item.year, reverse=True)
+        self.rebuild_max_install_lookup(preferred=installation)
+        self.update_conversion_controls()
+
+    def get_conversion_settings(self):
+        if not self.convert_version_var.get():
+            return ConversionSettings(enabled=False)
+
+        installation = self.max_install_lookup.get(self.max_install_var.get())
+        match = re.search(r'(\d{4})', self.target_version_var.get())
+        target_version = int(match.group(1)) if match else None
+        if installation is None:
+            messagebox.showerror(
+                "Пересохранение недоступно",
+                "Укажите установленный 3dsmax.exe.",
+            )
+            return None
+        if target_version not in installation.target_versions:
+            messagebox.showerror(
+                "Некорректная версия",
+                "Выберите одну из доступных предыдущих версий 3ds Max.",
+            )
+            return None
+        return ConversionSettings(
+            enabled=True,
+            installation=installation,
+            target_version=target_version,
+        )
 
     def build_batch_panel(self, parent):
         colors = self.COLORS
@@ -1509,7 +2185,7 @@ class App:
 
     def batch_status_tag(self, status):
         lowered = status.lower()
-        if lowered.startswith('архивируется'):
+        if lowered.startswith(('архивируется', 'пересохранение')):
             return 'active'
         if lowered.startswith('готов с'):
             return 'warning'
@@ -1549,6 +2225,129 @@ class App:
         ):
             widget.configure(state=state)
         self.on_batch_output_mode_changed(reset_statuses=False)
+
+    def convert_scene_for_archive(
+        self,
+        scene_path,
+        categories,
+        settings,
+        temp_root,
+        log_func,
+        progress_func,
+    ):
+        target = settings.target_version
+        installation = settings.installation
+        xrefs = []
+        if categories.get('xref', False):
+            log_func("Поиск XRef для пересохранения...")
+            parsed_paths = MaxParser(log_func).parse(scene_path)
+            xrefs = sorted(
+                (
+                    path for path in parsed_paths.get('xref', set())
+                    if os.path.isfile(path)
+                    and os.path.splitext(path)[1].lower() == '.max'
+                ),
+                key=str.casefold,
+            )
+
+        jobs = [(scene_path, None)] + [(xref, index) for index, xref in enumerate(xrefs)]
+        converter = MaxVersionConverter(
+            self.resource_path(os.path.join('assets', 'convert_max_version.ms')),
+            log_func,
+        )
+        converted = []
+        file_overrides = {}
+        main_name = (
+            os.path.splitext(os.path.basename(scene_path))[0]
+            + f"_Max{target}.max"
+        )
+
+        for position, (source_path, xref_index) in enumerate(jobs, 1):
+            if xref_index is None:
+                output_dir = os.path.join(temp_root, 'main')
+                output_name = main_name
+            else:
+                output_dir = os.path.join(temp_root, f'xref_{xref_index:04d}')
+                output_name = os.path.basename(source_path)
+            output_path = os.path.join(output_dir, output_name)
+            progress_func(int((position - 1) / len(jobs) * 35))
+            result = converter.convert(
+                source_path,
+                output_path,
+                installation,
+                target,
+            )
+            converted.append(result)
+            if xref_index is not None:
+                override_key = os.path.normcase(os.path.abspath(source_path))
+                file_overrides[override_key] = output_path
+            progress_func(int(position / len(jobs) * 35))
+
+        conversion_info = {
+            'runtime_version': installation.year,
+            'target_version': target,
+            'runtime_path': installation.launcher,
+            'scene_name': main_name,
+            'xref_count': len(xrefs),
+            'duration_seconds': sum(item.duration_seconds for item in converted),
+            'warnings': list(dict.fromkeys(
+                warning
+                for item in converted
+                for warning in item.warnings
+            )),
+        }
+        return {
+            'archive_scene_path': converted[0].converted_path,
+            'archive_scene_name': main_name,
+            'file_overrides': file_overrides,
+            'conversion_info': conversion_info,
+        }
+
+    def run_archive_job(
+        self,
+        scene_path,
+        archive_path,
+        categories,
+        organize,
+        conversion_settings,
+        progress_func,
+        log_func,
+    ):
+        stats = {'added': 0, 'resources': 0, 'missing': 0, 'errors': []}
+        try:
+            with tempfile.TemporaryDirectory(prefix='max_scene_packager_') as temp_root:
+                conversion_context = {}
+                archive_progress_start = 0
+                if conversion_settings.enabled:
+                    conversion_context = self.convert_scene_for_archive(
+                        scene_path,
+                        categories,
+                        conversion_settings,
+                        temp_root,
+                        log_func,
+                        progress_func,
+                    )
+                    archive_progress_start = 35
+
+                def archive_progress(value):
+                    mapped = archive_progress_start + (
+                        (100 - archive_progress_start) * float(value) / 100.0
+                    )
+                    progress_func(mapped)
+
+                archiver = Archiver(log_func)
+                return archiver.create(
+                    scene_path,
+                    archive_path,
+                    categories,
+                    organize,
+                    archive_progress,
+                    **conversion_context,
+                )
+        except Exception as exc:
+            log_func(f"ОШИБКА пересохранения: {exc}")
+            stats['errors'].append({'path': scene_path, 'message': str(exc)})
+            return False, 0, 0, stats
 
     def prepare_batch_jobs(self):
         if not self.batch_items:
@@ -1629,6 +2428,9 @@ class App:
     def start_batch_archive(self):
         if self.batch_running:
             return
+        conversion_settings = self.get_conversion_settings()
+        if conversion_settings is None:
+            return
         jobs = self.prepare_batch_jobs()
         if jobs is None:
             return
@@ -1672,7 +2474,13 @@ class App:
         self.log(f"Пакетная обработка: сцен — {len(jobs)}")
         threading.Thread(
             target=self.do_batch_archive,
-            args=(jobs, categories, organize, skipped_existing),
+            args=(
+                jobs,
+                categories,
+                organize,
+                skipped_existing,
+                conversion_settings,
+            ),
             daemon=True,
         ).start()
 
@@ -1684,7 +2492,15 @@ class App:
         self.set_status("Пакет: остановка после текущего архива")
         self.log("Пакет: запрошена остановка после текущего архива")
 
-    def do_batch_archive(self, jobs, categories, organize, skipped_existing):
+    def do_batch_archive(
+        self,
+        jobs,
+        categories,
+        organize,
+        skipped_existing,
+        conversion_settings=None,
+    ):
+        conversion_settings = conversion_settings or ConversionSettings(False)
         total = len(jobs)
         summary = {
             'ready': 0,
@@ -1713,17 +2529,23 @@ class App:
                 self.set_status(
                     f"Пакет: готово {number - 1} из {total} · {name} · {value}%"
                 )
-                self.set_batch_item_status(current, f"Архивируется · {value}%", value)
+                if conversion_settings.enabled and value < 35:
+                    row_status = f"Пересохранение · {value}%"
+                else:
+                    row_status = f"Архивируется · {value}%"
+                self.set_batch_item_status(current, row_status, value)
 
-            batch_archiver = Archiver(
-                lambda msg, current_prefix=prefix: self.log(msg, current_prefix)
+            job_log = lambda msg, current_prefix=prefix: self.log(
+                msg, current_prefix
             )
-            ok, count, size, stats = batch_archiver.create(
+            ok, count, size, stats = self.run_archive_job(
                 item.scene_path,
                 archive_path,
                 categories,
                 organize,
+                conversion_settings,
                 update_progress,
+                job_log,
             )
             processed += 1
             item.result = {
@@ -1737,7 +2559,11 @@ class App:
             if not ok:
                 summary['errors'] += 1
                 self.set_batch_item_status(item, "Ошибка", 100)
-            elif stats['missing'] or stats['errors']:
+            elif (
+                stats['missing']
+                or stats['errors']
+                or stats.get('conversion_warnings')
+            ):
                 summary['warnings'] += 1
                 self.set_batch_item_status(item, "Готов с предупреждениями", 100)
             else:
@@ -1862,8 +2688,15 @@ class App:
             self.btn_analyze.configure(state=state)
             self.btn_batch_start.configure(state=state)
             self.organize_checkbutton.configure(state=state)
+            self.convert_checkbutton.configure(state=state)
+            self.btn_browse_max.configure(state=state)
             for checkbutton in self.category_checkbuttons:
                 checkbutton.configure(state=state)
+            if enabled:
+                self.update_conversion_controls()
+            else:
+                self.max_install_combo.configure(state='disabled')
+                self.target_version_combo.configure(state='disabled')
         self.root.after(0, update)
     
     def start_analyze(self):
@@ -1907,72 +2740,122 @@ class App:
             self.set_progress(100)
     
     def start_archive(self):
-        if not self.scene_var.get():
+        scene_path = self.scene_var.get()
+        archive_path = self.archive_var.get()
+        if not scene_path:
             messagebox.showerror("Ошибка", "Выберите сцену!")
             return
-        if not os.path.exists(self.scene_var.get()):
+        if not os.path.exists(scene_path):
             messagebox.showerror("Ошибка", "Файл не найден!")
             return
-        if not self.archive_var.get():
+        if not archive_path:
             messagebox.showerror("Ошибка", "Укажите архив!")
             return
-        
-        threading.Thread(target=self.do_archive, daemon=True).start()
-    
-    def do_archive(self):
+        conversion_settings = self.get_conversion_settings()
+        if conversion_settings is None:
+            return
+        categories = {key: var.get() for key, var in self.cat_vars.items()}
+        organize = self.organize_var.get()
         self.set_enabled(False)
-        self.set_status("Архивация...")
         self.set_progress(0)
-        
+        threading.Thread(
+            target=self.do_archive,
+            args=(
+                scene_path,
+                archive_path,
+                categories,
+                organize,
+                conversion_settings,
+            ),
+            daemon=True,
+        ).start()
+
+    def do_archive(
+        self,
+        scene_path,
+        archive_path,
+        categories,
+        organize,
+        conversion_settings,
+    ):
         try:
-            cats = {k: v.get() for k, v in self.cat_vars.items()}
-            
-            ok, count, size, stats = self.archiver.create(
-                self.scene_var.get(),
-                self.archive_var.get(),
-                cats,
-                self.organize_var.get(),
-                self.set_progress
-            )
-            
-            if ok:
-                if stats['missing'] or stats['errors']:
-                    warning_lines = [
-                        "Архив создан, но не все ресурсы удалось добавить.",
-                        "",
-                        f"Ресурсов добавлено: {stats['resources']}",
-                        f"Отсутствует файлов: {stats['missing']}",
-                        f"Ошибок добавления: {len(stats['errors'])}",
-                        "",
-                        "Подробности находятся в _report.txt внутри архива.",
-                    ]
-                    self.set_status(
-                        f"Готово с предупреждениями: отсутствует {stats['missing']}, "
-                        f"ошибок {len(stats['errors'])}"
-                    )
-                    messagebox.showwarning(
-                        "Архив создан с предупреждениями", "\n".join(warning_lines)
-                    )
+            def update_progress(value):
+                self.set_progress(value)
+                if conversion_settings.enabled and value < 35:
+                    self.set_status("Пересохранение сцены в 3ds Max...")
                 else:
-                    self.set_status(
-                        f"Готово: {stats['resources']} ресурсов, {size:.1f} MB"
-                    )
-                    messagebox.showinfo(
-                        "Успех",
-                        f"Архив создан!\n\n"
-                        f"Ресурсов: {stats['resources']}\n"
-                        f"Файлов в архиве: {count}\n"
-                        f"Размер: {size:.1f} MB"
-                    )
-            else:
-                self.set_status("Ошибка")
-                messagebox.showerror("Ошибка", "Не удалось создать архив")
-        except Exception as e:
+                    self.set_status("Архивация...")
+
+            ok, count, size, stats = self.run_archive_job(
+                scene_path,
+                archive_path,
+                categories,
+                organize,
+                conversion_settings,
+                update_progress,
+                self.log,
+            )
+            self.root.after(
+                0,
+                lambda: self.finish_single_archive(ok, count, size, stats),
+            )
+        except Exception as exc:
+            self.log(f"ОШИБКА: {exc}")
+            self.root.after(
+                0,
+                lambda message=str(exc): self.finish_single_exception(message),
+            )
+
+    def finish_single_archive(self, ok, count, size, stats):
+        self.set_enabled(True)
+        if ok and (
+            stats['missing']
+            or stats['errors']
+            or stats.get('conversion_warnings')
+        ):
+            warning_lines = [
+                "Архив создан, но не все ресурсы удалось добавить.",
+                "",
+                f"Ресурсов добавлено: {stats['resources']}",
+                f"Отсутствует файлов: {stats['missing']}",
+                f"Ошибок добавления: {len(stats['errors'])}",
+                f"Предупреждений 3ds Max: {stats.get('conversion_warnings', 0)}",
+                "",
+                "Подробности находятся в _report.txt внутри архива.",
+            ]
+            self.set_status(
+                f"Готово с предупреждениями: отсутствует {stats['missing']}, "
+                f"ошибок {len(stats['errors'])}"
+            )
+            messagebox.showwarning(
+                "Архив создан с предупреждениями", "\n".join(warning_lines)
+            )
+        elif ok:
+            self.set_status(f"Готово: {stats['resources']} ресурсов, {size:.1f} MB")
+            conversion_line = ""
+            if stats.get('conversion'):
+                conversion_line = (
+                    f"\nВерсия сцены: 3ds Max "
+                    f"{stats['conversion']['target_version']}"
+                )
+            messagebox.showinfo(
+                "Успех",
+                f"Архив создан!\n\n"
+                f"Ресурсов: {stats['resources']}\n"
+                f"Файлов в архиве: {count}\n"
+                f"Размер: {size:.1f} MB"
+                f"{conversion_line}",
+            )
+        else:
             self.set_status("Ошибка")
-            self.log(f"ОШИБКА: {e}")
-            messagebox.showerror("Ошибка", str(e))
-        finally:
-            self.set_enabled(True)
+            details = stats.get('errors', [])
+            message = details[-1]['message'] if details else "Не удалось создать архив"
+            messagebox.showerror("Ошибка", message)
+
+    def finish_single_exception(self, message):
+        self.set_enabled(True)
+        self.set_status("Ошибка")
+        messagebox.showerror("Ошибка", message)
 
 
 def main():
